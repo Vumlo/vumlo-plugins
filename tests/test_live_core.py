@@ -1,0 +1,185 @@
+"""Opt-in integration test against a running Vumlo core.
+
+Required environment:
+  VUMLO_CORE_URL   Core API origin, e.g. http://127.0.0.1:8080/api/v1
+  VUMLO_CLI        Path to the built vumlo-cli
+  DATABASE_URL     PostgreSQL URL used by the running core
+  VUMLO_PLUGINS_SECRET_KEY  Same key used by the running core
+
+The test uses psql only to enqueue a real outbox event. The running core's
+event worker and plugin delivery worker perform the signed delivery.
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import secrets
+import shlex
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+import httpx
+import pytest
+
+ROOT = Path(__file__).parents[1]
+
+
+def _required(name: str) -> str:
+    value = os.getenv(name)
+    if not value:
+        pytest.skip(f"{name} is required for the live-core integration test")
+    return value
+
+
+def _install(cli: str, url: str, grant: str) -> tuple[str, str]:
+    result = subprocess.run(
+        [cli, "plugin", "install", url, "--grant", grant],
+        capture_output=True,
+        text=True,
+        env={**os.environ, "VUMLO__PLUGINS__SECRET_KEY": _required("VUMLO_PLUGINS_SECRET_KEY")},
+        check=True,
+    )
+    values = {}
+    for line in result.stdout.splitlines():
+        line = line.strip()
+        for key in ("VUMLO_PLUGIN_TOKEN", "VUMLO_WEBHOOK_SECRET"):
+            if line.startswith(f"{key}="):
+                values[key] = line.split("=", 1)[1]
+    assert values.keys() >= {"VUMLO_PLUGIN_TOKEN", "VUMLO_WEBHOOK_SECRET"}, result.stdout
+    return values["VUMLO_PLUGIN_TOKEN"], values["VUMLO_WEBHOOK_SECRET"]
+
+
+def _start(plugin_dir: str, port: int, token: str, secret: str) -> subprocess.Popen:
+    env = {
+        **os.environ,
+        "VUMLO_PLUGIN_TOKEN": token,
+        "VUMLO_WEBHOOK_SECRET": secret,
+        "PYTHONPATH": str(ROOT),
+    }
+    return subprocess.Popen(
+        [sys.executable, "-m", "uvicorn", "app:app", "--host", "127.0.0.1", "--port", str(port)],
+        cwd=ROOT / plugin_dir,
+        env=env,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+
+
+def _wait_health(url: str) -> None:
+    deadline = time.monotonic() + 15
+    while time.monotonic() < deadline:
+        try:
+            if httpx.get(f"{url}/health", timeout=1).status_code == 200:
+                return
+        except httpx.HTTPError:
+            pass
+        time.sleep(0.2)
+    raise AssertionError(f"{url} did not become ready")
+
+
+@pytest.mark.integration
+def test_install_scope_delivery_and_bad_signature_against_live_core():
+    core_url = _required("VUMLO_CORE_URL").rstrip("/")
+    cli = _required("VUMLO_CLI")
+    database_url = os.getenv("DATABASE_URL", "")
+    custom_psql = os.getenv("VUMLO_PSQL_COMMAND")
+    psql_command = shlex.split(custom_psql or "psql")
+    webhook_port = 19101
+    github_port = 19102
+    webhook_url = f"http://127.0.0.1:{webhook_port}"
+    github_url = f"http://127.0.0.1:{github_port}"
+    webhook = github = None
+    manifest_webhook = manifest_github = None
+    plugin_ids = ["webhook-forwarder", "github-repo-check"]
+    try:
+        assert httpx.get(f"{core_url}/health", timeout=5).status_code == 200
+        manifest_webhook = _start("webhook-forwarder", webhook_port, "", "")
+        manifest_github = _start("github-repo-check", github_port, "", "")
+        _wait_health(webhook_url)
+        _wait_health(github_url)
+        webhook_token, webhook_secret = _install(cli, webhook_url, "none")
+        github_token, github_secret = _install(
+            cli, github_url, "submissions:read,reports:write"
+        )
+        listed = subprocess.run(
+            [cli, "plugin", "list"],
+            capture_output=True,
+            text=True,
+            env={**os.environ, "VUMLO__PLUGINS__SECRET_KEY": _required("VUMLO_PLUGINS_SECRET_KEY")},
+            check=True,
+        )
+        assert "github-repo-check" in listed.stdout
+        assert "submissions:read, reports:write" in listed.stdout
+        for process in (manifest_webhook, manifest_github):
+            process.terminate()
+            process.wait(timeout=5)
+        manifest_webhook = manifest_github = None
+        webhook = _start("webhook-forwarder", webhook_port, webhook_token, webhook_secret)
+        github = _start("github-repo-check", github_port, github_token, github_secret)
+        _wait_health(webhook_url)
+        _wait_health(github_url)
+
+        event_id = secrets.token_hex(16)
+        payload = json.dumps(
+            {
+                "id": event_id,
+                "type": "submission.submitted",
+                "data": {
+                    "assignment_id": secrets.token_hex(16),
+                    "student_id": secrets.token_hex(16),
+                    "course_id": secrets.token_hex(16),
+                    "submission_id": secrets.token_hex(16),
+                },
+            }
+        )
+        subprocess.run(
+            [
+                *psql_command,
+                *([database_url] if database_url and not custom_psql else []),
+                "-v",
+                "ON_ERROR_STOP=1",
+                "-c",
+                "INSERT INTO events.outbox (id, type, version, payload) "
+                f"VALUES (gen_random_uuid(), 'submission.submitted', 1, '{payload}'::jsonb)",
+            ],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+
+        deadline = time.monotonic() + 20
+        while time.monotonic() < deadline:
+            webhook_events = httpx.get(f"{webhook_url}/health").json()["received_events"]
+            github_events = httpx.get(f"{github_url}/health").json()["received_events"]
+            if webhook_events >= 1 and github_events >= 1:
+                break
+            time.sleep(0.5)
+        assert webhook_events >= 1
+        assert github_events >= 1
+
+        for url in (webhook_url, github_url):
+            bad = httpx.post(
+                f"{url}/events",
+                content=b"{}",
+                headers={
+                    "X-Vumlo-Timestamp": str(int(time.time())),
+                    "X-Vumlo-Signature": "sha256=invalid",
+                },
+            )
+            assert bad.status_code == 401
+    finally:
+        for process in (webhook, github, manifest_webhook, manifest_github):
+            if process:
+                process.terminate()
+                process.wait(timeout=5)
+        for plugin_id in plugin_ids:
+            subprocess.run(
+                [cli, "plugin", "remove", plugin_id, "--yes"],
+                env={**os.environ, "VUMLO__PLUGINS__SECRET_KEY": os.getenv("VUMLO_PLUGINS_SECRET_KEY", "")},
+                capture_output=True,
+                text=True,
+            )

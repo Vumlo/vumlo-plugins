@@ -14,6 +14,7 @@ def create_plugin_app(plugin_manifest: dict, on_event=None) -> FastAPI:
     app = FastAPI(title=plugin_manifest["id"])
     seen: set[str] = set()
     lock = threading.Lock()
+    app.state.received_events = []
 
     @app.get("/manifest")
     def get_manifest():
@@ -34,8 +35,14 @@ def create_plugin_app(plugin_manifest: dict, on_event=None) -> FastAPI:
         with lock:
             first = event_id not in seen
             seen.add(event_id)
+            if first:
+                app.state.received_events.append(event)
         if first and on_event:
             on_event(event_type, event)
         return JSONResponse({}, status_code=202)
+
+    @app.get("/health")
+    def health():
+        return {"plugin": plugin_manifest["id"], "received_events": len(app.state.received_events)}
 
     return app
