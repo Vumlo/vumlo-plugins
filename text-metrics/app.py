@@ -4,7 +4,7 @@ from vumlo_plugins.protocol import PluginClient, manifest
 MANIFEST = manifest(
     "text-metrics", "1.0.0",
     subscribes=("submission.submitted",),
-    scopes=("submissions:read", "reports:write"),
+    scopes=("submissions:read", "reports:write", "settings:read"),
     settings={
         "minimum_words": {"type": "number", "scope": "course", "description": "Minimum word count"},
         "maximum_words": {"type": "number", "scope": "course", "description": "Maximum word count"},
@@ -26,6 +26,22 @@ def process(kind, event):
     submission = client.submission(data["submission_id"])
     value = text(submission["content"]).strip()
     words = len(value.split())
-    client.report(data["submission_id"], f"{words} words", {"words": words, "characters": len(value), "minimum": None, "maximum": None})
+    settings = client.settings(data["course_id"])
+    minimum = settings.get("minimum_words")
+    maximum = settings.get("maximum_words")
+    minimum_ok = minimum is None or words >= minimum
+    maximum_ok = maximum is None or words <= maximum
+    client.report(
+        data["submission_id"],
+        f"{words} words",
+        {
+            "words": words,
+            "characters": len(value),
+            "minimum": minimum,
+            "maximum": maximum,
+            "minimum_ok": minimum_ok,
+            "maximum_ok": maximum_ok,
+        },
+    )
 
 app = create_plugin_app(MANIFEST, process)
