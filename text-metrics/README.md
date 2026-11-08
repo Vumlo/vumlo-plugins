@@ -2,7 +2,8 @@
 
 On `submission.submitted`, reads the submitted block document and posts a
 report with word and character counts plus course-scoped min/max checks. It
-requests `submissions:read`, `reports:write`, and `settings:read`.
+requests `submissions:read`, `reports:write`, and `settings:read`, then writes
+`PUT /plugin-api/submissions/{id}/reports/text_metrics`.
 
 ## Needs from core
 

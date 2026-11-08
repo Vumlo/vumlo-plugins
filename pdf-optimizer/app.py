@@ -9,7 +9,7 @@ app = FastAPI(title="pdf-optimizer")
 
 @app.get("/manifest")
 def manifest():
-    return {"id": "pdf-optimizer", "version": "1.0.0", "api": "1", "subscribes": [], "scopes": [], "ui": [], "settings": {}}
+    return {"id": "pdf-optimizer", "version": "1.0.0", "api": "1", "subscribes": [], "scopes": [], "ui": [], "settings": {}, "routes": [{"method": "GET", "path": "/", "roles": ["teacher"]}, {"method": "POST", "path": "/optimize", "roles": ["teacher"]}]}
 
 @app.get("/")
 def upload_page():

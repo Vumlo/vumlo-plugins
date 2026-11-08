@@ -10,7 +10,7 @@ app = FastAPI(title="completion-certificate")
 
 @app.get("/manifest")
 def manifest():
-    return {"id": "completion-certificate", "version": "1.0.0", "api": "1", "subscribes": [], "scopes": [], "ui": [], "settings": {"verification_base_url": {"type": "string", "description": "Verification URL base"}}}
+    return {"id": "completion-certificate", "version": "1.0.0", "api": "1", "subscribes": [], "scopes": ["assignments:read", "grades:read", "roster:read"], "ui": [], "settings": {"verification_base_url": {"type": "string", "description": "Verification URL base"}}, "routes": [{"method": "POST", "path": "/certificate", "roles": ["teacher"]}]}
 
 @app.post("/certificate")
 def certificate(data: dict):

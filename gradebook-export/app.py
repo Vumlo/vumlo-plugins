@@ -7,7 +7,7 @@ app = FastAPI(title="gradebook-export")
 
 @app.get("/manifest")
 def manifest():
-    return {"id": "gradebook-export", "version": "1.0.0", "api": "1", "subscribes": [], "scopes": [], "ui": [], "settings": {}}
+    return {"id": "gradebook-export", "version": "1.0.0", "api": "1", "subscribes": [], "scopes": ["grades:read", "roster:read"], "ui": [], "settings": {}, "routes": [{"method": "POST", "path": "/export", "roles": ["teacher"]}]}
 
 @app.post("/export")
 def export(rows: list[dict]):

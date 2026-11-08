@@ -7,7 +7,7 @@ import threading
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 
-from .protocol import manifest, verify_event
+from .protocol import verify_event, verify_proxy
 
 
 def create_plugin_app(plugin_manifest: dict, on_event=None) -> FastAPI:
@@ -46,3 +46,18 @@ def create_plugin_app(plugin_manifest: dict, on_event=None) -> FastAPI:
         return {"plugin": plugin_manifest["id"], "received_events": len(app.state.received_events)}
 
     return app
+
+
+async def signed_identity(request: Request) -> dict[str, str]:
+    body = await request.body()
+    identity = verify_proxy(
+        os.getenv("VUMLO_WEBHOOK_SECRET", ""),
+        dict(request.headers),
+        body,
+        method=request.method,
+        target=request.url.path + (f"?{request.url.query}" if request.url.query else ""),
+    )
+    if identity is None:
+        from fastapi import HTTPException
+        raise HTTPException(status_code=401, detail="invalid Vumlo proxy signature")
+    return identity

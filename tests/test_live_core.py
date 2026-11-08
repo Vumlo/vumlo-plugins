@@ -37,7 +37,7 @@ def _required(name: str) -> str:
 
 def _install(cli: str, url: str, grant: str) -> tuple[str, str]:
     result = subprocess.run(
-        [cli, "plugin", "install", url, "--grant", grant],
+        [cli, "plugin", "install", url, "--grant", grant, "--courses", "all"],
         capture_output=True,
         text=True,
         env={**os.environ, "VUMLO__PLUGINS__SECRET_KEY": _required("VUMLO_PLUGINS_SECRET_KEY")},

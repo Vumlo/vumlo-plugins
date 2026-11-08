@@ -32,7 +32,7 @@ def process(kind, event):
     minimum_ok = minimum is None or words >= minimum
     maximum_ok = maximum is None or words <= maximum
     client.report(
-        data["submission_id"],
+        f"submission:{data['submission_id']}", "text_metrics",
         f"{words} words",
         {
             "words": words,
