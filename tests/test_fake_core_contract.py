@@ -144,7 +144,7 @@ def test_the_mail_contract_schemas():
     for body in bad:
         with pytest.raises(AssertionError):
             contract.check_body("POST", "/plugin-api/mail", body)
-    reasons = {"opted_out": 0, "no_address": 0, "duplicate": 0, "disabled": 0}
+    reasons = {"opted_out": 0, "no_address": 0, "duplicate": 0, "disabled": 0, "rate_limited": 0}
     contract.check_response("POST", "/plugin-api/mail", 202, {"accepted": 1, "skipped": 0, "skipped_reasons": reasons})
     for answer in ({"accepted": 1, "skipped": 0}, {"accepted": 1, "skipped": 0, "skipped_reasons": {"opted_out": 0}},
                    {"accepted": -1, "skipped": 0, "skipped_reasons": reasons}):

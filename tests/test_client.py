@@ -48,7 +48,7 @@ async def test_pagination_follows_the_cursor_to_the_end(world):
     assert len(pages) == 3 and all("limit" not in c.query for c in pages[:1])
 
 
-async def test_a_cursor_that_repeats_ends_the_loop(fake):
+async def test_a_cursor_that_repeats_is_an_error_not_a_silently_cut_list(fake):
     seen = []
 
     def handler(request: httpx.Request) -> httpx.Response:
@@ -56,7 +56,8 @@ async def test_a_cursor_that_repeats_ends_the_loop(fake):
         return httpx.Response(200, json={"items": [{"id": len(seen)}], "next_cursor": "same"})
 
     client = PluginClient("http://core/api/v1", "t", transport=httpx.MockTransport(handler))
-    assert len(await client.all("/plugin-api/x")) == 2
+    with pytest.raises(CoreError, match="repeats"):
+        await client.all("/plugin-api/x")
     assert seen == [None, "same"]
 
 
@@ -105,8 +106,11 @@ async def test_status_codes_become_typed_errors(world):
     with pytest.raises(NotFound) as missing:
         await client.assignment("00000000-0000-4000-8000-0000000fffff")
     assert missing.value.status == 404 and "no such assignment" in str(missing.value)
-    with pytest.raises(Invalid):
+    with pytest.raises(ValueError):  # the client does not send an id that is not a UUID ...
         await client.assignment("not-a-uuid")
+    with pytest.raises(Invalid) as malformed:  # ... and the core would answer 400 (axum's path rejection)
+        await client.request("GET", "/plugin-api/assignments/not-a-uuid")
+    assert malformed.value.status == 400
     fake.grant(scopes={"reports:write"})
     with pytest.raises(Forbidden):
         await client.assignments()
@@ -165,12 +169,12 @@ async def test_a_wait_longer_than_a_minute_is_not_slept_through(world):
     assert limited.value.retry_after == 3600 and fake.slept == []
 
 
-async def test_a_lost_connection_is_retried_for_reads_but_not_for_a_post():
+async def test_a_lost_connection_is_retried_for_reads_but_a_post_only_when_it_never_left():
     attempts = []
 
     def handler(request: httpx.Request) -> httpx.Response:
         attempts.append(request.method)
-        raise httpx.ConnectError("down")
+        raise httpx.ConnectError("down")  # nothing reached the core: even a POST may go again
 
     slept = []
 
@@ -184,7 +188,7 @@ async def test_a_lost_connection_is_retried_for_reads_but_not_for_a_post():
     attempts.clear()
     with pytest.raises(Unreachable):
         await client.mail.send(kind="k", subject="s", text="t", user_id="00000000-0000-4000-8000-000000000001")
-    assert attempts == ["POST"]
+    assert attempts == ["POST"] * 4  # (a read timeout of a POST is sent once: see test_adversarial)
 
 
 async def test_a_mail_5xx_is_not_retried_but_a_429_is(world):
@@ -264,7 +268,7 @@ async def test_mail_to_one_person_and_to_an_audience(world):
                                  text="New deadline", link_path=f"/courses/{course['id']}/assignments/{work['id']}",
                                  dedupe_key="d1")
     assert (one.accepted, one.skipped, one.skipped_reasons) == (
-        1, 0, {"opted_out": 0, "no_address": 0, "duplicate": 0, "disabled": 0})
+        1, 0, {"opted_out": 0, "no_address": 0, "duplicate": 0, "disabled": 0, "rate_limited": 0})
     everyone = await client.mail.send(kind="deadline_changed", course_id=course["id"], audience="students",
                                       subject="Moved", text="New deadline", dedupe_key="d1")
     assert (everyone.accepted, everyone.skipped_reasons["duplicate"]) == (4, 1)  # the first student had it already
@@ -282,7 +286,8 @@ async def test_mail_skips_the_opted_out_the_disabled_and_those_without_an_addres
     fake.users[students[2]["id"]]["status"] = "blocked"
     result = await client.mail.send(kind="news", course_id=course["id"], audience="students", subject="s", text="t")
     assert (result.accepted, result.skipped) == (2, 3)
-    assert result.skipped_reasons == {"opted_out": 1, "no_address": 1, "duplicate": 0, "disabled": 1}
+    assert result.skipped_reasons == {"opted_out": 1, "no_address": 1, "duplicate": 0, "disabled": 1,
+                                      "rate_limited": 0}
     other_kind = await client.mail.send(kind="other", user_id=students[0]["id"], subject="s", text="t")
     assert other_kind.accepted == 1  # an opt-out is per kind
 
@@ -335,18 +340,22 @@ async def test_mail_without_configuration_is_503(world):
 
 async def test_mail_limits_answer_429_with_retry_after(world):
     fake, client, course, teacher, students, work = world
-    fake.mail_limits["audience"] = 3
-    with pytest.raises(RateLimited) as large:
+    fake.mail_limits["max_audience"] = 3
+    with pytest.raises(Invalid) as large:  # not a 429: asking again changes nothing
         await client.mail.send(kind="k", course_id=course["id"], audience="students", subject="s", text="t")
-    assert large.value.retry_after == 3600 and fake.mails == []
-    fake.mail_limits.update(audience=2000, per_recipient_day=2)
+    assert large.value.status == 422 and fake.mails == []
+    fake.mail_limits.update(max_audience=2000, recipient_daily=2)
     for _ in range(2):
         await client.mail.send(kind="k", user_id=students[0]["id"], subject="s", text="t")
-    with pytest.raises(RateLimited):
+    with pytest.raises(RateLimited) as day:
         await client.mail.send(kind="k", user_id=students[0]["id"], subject="s", text="t")
+    assert 0 < day.value.retry_after <= 86400
+    # An audience skips the person who is over the limit and mails the rest.
+    answer = await client.mail.send(kind="k", course_id=course["id"], audience="students", subject="s", text="t")
+    assert (answer.accepted, answer.skipped_reasons["rate_limited"]) == (4, 1)
     clock.advance(days=1, seconds=1)
     await client.mail.send(kind="k", user_id=students[0]["id"], subject="s", text="t")
-    fake.mail_limits.update(per_plugin_hour=2, per_recipient_day=20)
+    fake.mail_limits.update(plugin_hourly_calls=2, recipient_daily=20)
     clock.advance(hours=2)
     await client.mail.send(kind="k", user_id=students[1]["id"], subject="s", text="t")
     await client.mail.send(kind="k", user_id=students[2]["id"], subject="s", text="t")

@@ -43,14 +43,19 @@ def _header(headers: Mapping[str, str], name: str) -> str | None:
 
 
 def _fresh(headers: Mapping[str, str], now: float | None) -> str:
+    """The timestamp as sent, if it is plain ASCII digits (what the core writes) and within 300 s of now."""
     timestamp = _header(headers, "x-vumlo-timestamp") or ""
-    try:
-        sent_at = int(timestamp)
-    except ValueError:
-        raise Refused(401, "bad timestamp") from None
-    if abs((clock.timestamp() if now is None else now) - sent_at) > MAX_AGE_SECONDS:
+    if not (timestamp.isascii() and timestamp.isdigit() and len(timestamp) <= 12):
+        raise Refused(401, "bad timestamp")
+    if abs((clock.timestamp() if now is None else now) - int(timestamp)) > MAX_AGE_SECONDS:
         raise Refused(401, "stale timestamp")
     return timestamp
+
+
+def _same(expected: str, given: str | None) -> bool:
+    """Constant-time comparison. On bytes: `compare_digest` raises on a `str` with a non-ASCII character, and a
+    header can carry one."""
+    return hmac.compare_digest(expected.encode(), (given or "").encode("utf-8", "surrogatepass"))
 
 
 def verify_event(secret: str, headers: Mapping[str, str], body: bytes, now: float | None = None) -> None:
@@ -58,8 +63,7 @@ def verify_event(secret: str, headers: Mapping[str, str], body: bytes, now: floa
     if not secret:
         raise Refused(503, "no webhook secret configured")
     timestamp = _fresh(headers, now)
-    expected = sign(secret, timestamp, body)
-    if not hmac.compare_digest(expected, _header(headers, "x-vumlo-signature") or ""):
+    if not _same(sign(secret, timestamp, body), _header(headers, "x-vumlo-signature")):
         raise Refused(401, "bad signature")
 
 
@@ -144,7 +148,7 @@ def verify_proxy(
     course_role = _header(headers, "x-vumlo-course-role") or None
     expected = proxy_signature(secret, timestamp, nonce=nonce, method=method, target=target, user=user,
                                role=role, course=course, course_role=course_role, body=body)
-    if not nonce or not hmac.compare_digest(expected, _header(headers, "x-vumlo-signature") or ""):
+    if not nonce or not _same(expected, _header(headers, "x-vumlo-signature")):
         raise Refused(401, "bad signature")
     if nonces is not None:
         nonces.take(nonce, moment)

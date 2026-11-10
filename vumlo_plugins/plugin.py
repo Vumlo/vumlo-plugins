@@ -120,6 +120,7 @@ class Plugin:
             self._state = state
         if secret is not None:
             self._secret = secret
+            self.log.protect(secret)
 
     # -- declaring --------------------------------------------------------------------------------------------
 

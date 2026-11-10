@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import re
 import sys
 import traceback
@@ -14,16 +15,28 @@ from typing import Any
 from . import clock
 
 SENSITIVE = ("token", "secret", "password", "passwd", "authorization", "email", "address", "api_key", "apikey",
-             "signature")
+             "signature", "signing", "cookie", "credential", "private_key", "bearer", "session")
+ENV_SECRETS = ("VUMLO_PLUGIN_TOKEN", "VUMLO_WEBHOOK_SECRET")
 _PATTERNS = (
+    (re.compile(r"(?i)\b([a-z][a-z0-9+.-]*://)[^/\s@]+@"), r"\1[credentials]@"),
     (re.compile(r"[\w.+-]+@[\w-]+(?:\.[\w-]+)+"), "[email]"),
     (re.compile(r"vplg_[A-Za-z0-9_-]+"), "[token]"),
     (re.compile(r"(?i)bearer\s+[A-Za-z0-9._~+/=-]+"), "Bearer [token]"),
     (re.compile(r"(?i)\b(gh[pousr]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,})"), "[token]"),
 )
+_protected: set[str] = set()
+
+
+def protect(*values: str) -> None:
+    """Masks these exact strings in every line from now on: the secret settings an administrator typed (a webhook
+    URL, a signing key, a GitHub token). The two secrets of the environment are always masked."""
+    _protected.update(v for v in values if isinstance(v, str) and len(v) >= 6)
 
 
 def scrub(text: str) -> str:
+    for secret in sorted(_protected | {os.environ.get(name, "") for name in ENV_SECRETS}, key=len, reverse=True):
+        if len(secret) >= 6:
+            text = text.replace(secret, "[secret]")
     for pattern, mask in _PATTERNS:
         text = pattern.sub(mask, text)
     return text
@@ -34,6 +47,10 @@ def _clean(name: str, value: Any) -> Any:
         return "[redacted]"
     if value is None or isinstance(value, (bool, int, float)):
         return value
+    if isinstance(value, dict):
+        return {str(k): _clean(str(k), v) for k, v in value.items()}
+    if isinstance(value, (list, tuple, set, frozenset)):
+        return [_clean(name, v) for v in value]
     return scrub(str(value))
 
 
@@ -73,6 +90,8 @@ class Log:
             handler.setFormatter(_Json())
             self._logger.addHandler(handler)
             self._logger.setLevel(logging.INFO)
+
+    protect = staticmethod(protect)
 
     def _write(self, level: int, msg: str, fields: dict[str, Any], exc_info: bool = False) -> None:
         clean = {k: _clean(k, v) for k, v in fields.items() if k not in ("time", "level", "plugin", "msg")}

@@ -5,6 +5,7 @@ so a lost file costs a refetch, not a record."""
 from __future__ import annotations
 
 import json
+import logging
 import os
 import sqlite3
 import threading
@@ -12,6 +13,10 @@ from pathlib import Path
 from typing import Any
 
 from . import clock
+
+
+class _Corrupt(Exception):
+    pass
 
 
 def data_dir() -> Path:
@@ -22,25 +27,53 @@ class State:
     """`State()` opens `<data dir>/state.db`; `State(":memory:")` is for tests. Values are JSON."""
 
     def __init__(self, path: str | Path | None = None):
-        if str(path) == ":memory:":
-            target = ":memory:"
-        else:
-            folder = Path(path) if path else data_dir()
-            folder.mkdir(parents=True, exist_ok=True)
-            target = str(folder / "state.db")
-        self._db = sqlite3.connect(target, check_same_thread=False, isolation_level=None)
         self._lock = threading.Lock()
-        with self._lock:
-            self._db.execute("PRAGMA journal_mode=WAL")
-            self._db.execute("PRAGMA synchronous=NORMAL")
-            self._db.execute(
+        if str(path) == ":memory:":
+            self._db = self._open(":memory:")
+            return
+        folder = Path(path) if path else data_dir()
+        folder.mkdir(parents=True, exist_ok=True)
+        target = folder / "state.db"
+        try:
+            self._db = self._open(str(target))
+        except _Corrupt:
+            # The file is only a cache of what the core can say again: set it aside (for a look) and start empty.
+            stamp = clock.timestamp()
+            for suffix in ("", "-wal", "-shm"):
+                if (aside := Path(f"{target}{suffix}")).exists():
+                    aside.rename(f"{target}.corrupt-{stamp}{suffix}")
+            logging.getLogger("vumlo_plugins.state").warning("the state file was damaged: set aside, starting empty")
+            self._db = self._open(str(target))
+
+    @staticmethod
+    def _open(target: str) -> sqlite3.Connection:
+        db = sqlite3.connect(target, check_same_thread=False, isolation_level=None)
+        try:
+            db.execute("PRAGMA journal_mode=WAL")
+            db.execute("PRAGMA synchronous=NORMAL")
+            db.execute(
                 "CREATE TABLE IF NOT EXISTS kv (ns TEXT NOT NULL, key TEXT NOT NULL, value TEXT NOT NULL, "
                 "updated_at INTEGER NOT NULL, PRIMARY KEY (ns, key))")
+            if db.execute("PRAGMA quick_check").fetchone()[0] != "ok":
+                raise _Corrupt
+        except sqlite3.DatabaseError as error:
+            db.close()
+            # 11 is SQLITE_CORRUPT, 26 SQLITE_NOTADB; a locked file (another worker starting) is neither.
+            if (getattr(error, "sqlite_errorcode", 0) or 0) & 0xFF in (11, 26):
+                raise _Corrupt from None
+            raise
+        except _Corrupt:
+            db.close()
+            raise
+        return db
 
     def get(self, ns: str, key: str, default: Any = None) -> Any:
         with self._lock:
             row = self._db.execute("SELECT value FROM kv WHERE ns=? AND key=?", (ns, key)).fetchone()
-        return default if row is None else json.loads(row[0])
+        try:
+            return default if row is None else json.loads(row[0])
+        except ValueError:
+            return default
 
     def set(self, ns: str, key: str, value: Any) -> None:
         with self._lock:
@@ -56,7 +89,13 @@ class State:
     def items(self, ns: str) -> dict[str, Any]:
         with self._lock:
             rows = self._db.execute("SELECT key, value FROM kv WHERE ns=?", (ns,)).fetchall()
-        return {key: json.loads(value) for key, value in rows}
+        found = {}
+        for key, value in rows:
+            try:
+                found[key] = json.loads(value)
+            except ValueError:
+                pass
+        return found
 
     def seen(self, ns: str, key: str) -> bool:
         """Records `key` and says whether it was new. Atomic: of two callers with the same key only one gets True."""

@@ -59,9 +59,9 @@ def test_levels_titles_and_reserved_display():
         Report.build("x", data={"display": {}})
 
 
-def test_the_summary_is_one_line_of_at_most_500_characters():
+def test_the_summary_is_one_line_of_at_most_500_bytes():
     summary = Report.build("a\nb\tc" + "x" * 600).summary
-    assert len(summary) == 500 and "\n" not in summary and "\t" not in summary and summary.endswith("…")
+    assert len(summary.encode()) == 500 and "\n" not in summary and "\t" not in summary and summary.endswith("…")
 
 
 def test_cells_are_strings_or_numbers_and_never_break_json():

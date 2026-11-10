@@ -58,4 +58,6 @@ def parse_time(text: str) -> datetime:
 
 def iso(moment: datetime) -> str:
     """RFC 3339 in UTC with a `Z`, the form the core reads and writes."""
+    if moment.tzinfo is None:  # naive means UTC here, as in `freeze` (`astimezone` would read it as local time)
+        moment = moment.replace(tzinfo=UTC)
     return moment.astimezone(UTC).isoformat().replace("+00:00", "Z")

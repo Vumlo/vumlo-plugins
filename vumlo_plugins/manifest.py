@@ -8,6 +8,7 @@ changes a rule, change it here too.
 
 from __future__ import annotations
 
+import math
 import re
 import unicodedata
 from typing import Any
@@ -51,6 +52,11 @@ def _shown(value: Any) -> str:
     return f"`{text[:40]}…`" if len(text) > 40 else f"`{text}`"
 
 
+def _ascii_upper(text: str) -> str:
+    """Rust's `to_ascii_uppercase`: Python's `upper()` also turns `ſ` into `S`, so `PoſT` would pass here only."""
+    return "".join(c.upper() if c.isascii() else c for c in text)
+
+
 def _is_control(char: str) -> bool:
     return unicodedata.category(char) == "Cc"
 
@@ -92,7 +98,7 @@ def route(
     method: str, path: str, *, roles: list[str] | tuple[str, ...] = (), course_roles: list[str] | tuple[str, ...] = (),
     auth: str | None = None,
 ) -> dict[str, Any]:
-    spec: dict[str, Any] = {"method": method, "path": path}
+    spec: dict[str, Any] = {"method": _ascii_upper(method), "path": path}
     if auth:
         spec["auth"] = auth
     if roles:
@@ -235,7 +241,7 @@ def _route(entry: Any) -> dict[str, Any]:
     _shape(entry.get("auth") is None or isinstance(entry["auth"], str), "`auth` must be a string")
     roles_in = _str_list(entry.get("roles", []), "roles")
     course_roles_in = _str_list(entry.get("course_roles", []), "course_roles")
-    method = entry["method"].upper()
+    method = _ascii_upper(entry["method"])
     if method not in ROUTE_METHODS:
         raise ManifestError(f"route method {_shown(entry['method'])} is not one of {', '.join(ROUTE_METHODS)}")
     path = entry["path"]
@@ -345,6 +351,8 @@ def _setting_spec(key: str, spec: Any) -> dict[str, Any]:
         raise bad("`minimum` and `maximum` are for numbers")
     if minimum is not None and maximum is not None and minimum > maximum:
         raise bad("`minimum` is above `maximum`")
+    if any(isinstance(v, float) and not math.isfinite(v) for v in (minimum, maximum)):
+        raise bad("`minimum` and `maximum` must be finite")
     if options is not None:
         if kind != "string":
             raise bad("`enum` is for strings")

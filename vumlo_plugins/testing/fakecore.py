@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import base64
 import json
+import math
 import re
 import unicodedata
 import uuid
@@ -126,7 +127,10 @@ class FakeCore:
         self.setting_specs: dict[str, dict[str, Any]] = {}
         self.tombstone_days = 30
         self.mail_configured = True
-        self.mail_limits = {"per_plugin_hour": 500, "per_recipient_day": 20, "audience": 2000}
+        # The names of `[mail]` in the core: calls (not messages) per plugin per hour, messages per person per day,
+        # people per call.
+        self.mail_limits = {"plugin_hourly_calls": 500, "recipient_daily": 20, "max_audience": 2000}
+        self._mail_calls: list[datetime] = []
         self.mail_dedupe_days = 30
         self.teacher_audience = ("teacher", "assistant")
         self.mails: list[dict[str, Any]] = []
@@ -304,8 +308,8 @@ class FakeCore:
     def _build_app(self) -> Starlette:
         r = []
 
-        def add(method: str, template: str, scope: str | None, fn, starlette_path: str | None = None):
-            r.append(Route(starlette_path or template, self._wrap(method, template, scope, fn), methods=[method]))
+        def add(method: str, template: str, scope: str | None, fn, early=None):
+            r.append(Route(template, self._wrap(method, template, scope, fn, early), methods=[method]))
 
         p = "/plugin-api"
         add("GET", f"{p}/assignments", "assignments:read", self._assignments)
@@ -322,14 +326,17 @@ class FakeCore:
         add("GET", f"{p}/announcements/deleted", "announcements:read", self._deleted_announcements)
         add("GET", f"{p}/settings", "settings:read", self._settings)
         for kind in ("submissions", "assignments", "courses"):
-            add("PUT", f"{p}/{kind}/{{id}}/reports/{{key}}", "reports:write", self._put_report)
-            add("DELETE", f"{p}/{kind}/{{id}}/reports/{{key}}", "reports:write", self._delete_report)
+            add("PUT", f"{p}/{kind}/{{id}}/reports/{{key}}", "reports:write", self._put_report, self._early_report)
+            add("DELETE", f"{p}/{kind}/{{id}}/reports/{{key}}", "reports:write", self._delete_report,
+                self._early_path_id)
             add("GET", f"/{kind}/{{id}}/plugin-reports", None, self._staff_reports)
-        add("POST", f"{p}/mail", "mail:send", self._mail)
+        add("POST", f"{p}/mail", "mail:send", self._mail, self._early_mail)
         return Starlette(routes=[Route(API + route.path, route.endpoint, methods=list(route.methods - {"HEAD"}))
                                  for route in r])
 
-    def _wrap(self, method: str, template: str, scope: str | None, fn):
+    def _wrap(self, method: str, template: str, scope: str | None, fn, early=None):
+        """The order of the core's extractors: the token (401), then the ids of the path (400) and the body (422)
+        (`early`), and only then the scope (403) and what the handler looks up (404, 403)."""
         async def endpoint(request: Request) -> Response:
             call = Call(method, template, list(request.query_params.keys()))
             self.calls.append(call)
@@ -339,9 +346,14 @@ class FakeCore:
                 self._injected(method, request.url.path)
                 if scope is not None:
                     self._authenticate(request)
-                    if scope not in self.scopes:
-                        raise Problem(403, f"the plugin was not granted `{scope}`")
-                status, body, headers = fn(request, await self._json(request, method), **request.path_params)
+                parsed = await self._json(request, method)
+                if scope is not None and early is not None:
+                    early(request, parsed)
+                if scope is not None and scope not in self.scopes:
+                    raise Problem(403, f"the plugin was not granted `{scope}`")
+                if self.validate and parsed is not None:
+                    contract.check_body(method, template, parsed)
+                status, body, headers = fn(request, parsed, **request.path_params)
             except Problem as problem:
                 status, body, headers = problem.status, problem.body(), problem.headers
             call.status = status
@@ -410,6 +422,8 @@ class FakeCore:
             raise Problem(422, "limit is 1 to 100")
         offset = 0
         if "cursor" in params:
+            if not 1 <= len(params["cursor"]) <= 100:
+                raise Problem(422, "cursor is 1 to 100 characters")
             try:
                 tag, _, number = base64.urlsafe_b64decode(params["cursor"]).decode().partition(":")
                 offset = int(number)
@@ -429,7 +443,10 @@ class FakeCore:
         if text is None:
             return None
         try:
-            return clock.parse_time(text.replace(" ", "+"))
+            # No repair of a `+` that arrived as a space: the core's query parser would not repair it either.
+            if not re.search(r"T.*(Z|[+-]\d\d:\d\d)$", text):  # RFC 3339 has a time and an offset
+                raise ValueError(text)
+            return clock.parse_time(text)
         except ValueError:
             raise Problem(422, f"{name} is not an RFC 3339 time") from None
 
@@ -558,44 +575,66 @@ class FakeCore:
 
     # -- reports --
 
-    def _subject(self, request, id: str) -> tuple[str, str, str]:
-        # "/api/v1/plugin-api/<kind>/..." or "/api/v1/<kind>/...", after the empty segment before the first "/".
-        segment = request.url.path.split("/")[4 if request.url.path.startswith(API + "/plugin-api") else 3]
-        kind = {"submissions": "submission", "assignments": "assignment", "courses": "course"}[segment]
-        sid = self._uuid(id, "id")
-        table = {"submission": self.submissions, "assignment": self.assignments, "course": self.courses}[kind]
-        subject = table.get(sid)
-        if subject is None:
-            raise Problem(404, "there is no such submitted attempt, assignment or course")
-        return kind, sid, subject["id"] if kind == "course" else subject["course_id"]
+    @staticmethod
+    def _early_path_id(request, _body) -> None:
+        FakeCore._uuid_of_path(request.path_params["id"])
 
-    def _put_report(self, request, body, id, key):
-        if not is_report_key(key):
-            raise Problem(422, "the key is not valid", errors=[{"field": "key", "message": "must be a slug"}])
-        kind, sid, course_id = self._subject(request, id)
-        self._reach(course_id)
+    @staticmethod
+    def _uuid_of_path(text: str) -> str:
+        try:
+            return str(uuid.UUID(text))
+        except ValueError:
+            raise Problem(400, "id is not a UUID") from None
+
+    @classmethod
+    def _early_report(cls, request, body) -> None:
+        """What the extractors of a PUT answer before the handler runs: a malformed id (400), a body that is not a
+        report (422)."""
+        cls._uuid_of_path(request.path_params["id"])
         errors = []
         if not isinstance(body, dict) or not isinstance(body.get("summary"), str) \
-                or not 1 <= len(body["summary"]) <= 500:
-            errors.append({"field": "summary", "message": "must be 1 to 500 characters"})
+                or not 1 <= len(body["summary"].encode()) <= 500:  # garde `length` counts bytes
+            errors.append({"field": "summary", "message": "must be 1 to 500 bytes"})
         data = body.get("data") if isinstance(body, dict) else None
         if not isinstance(data, dict) or len(json.dumps(data, separators=(",", ":"), ensure_ascii=False).encode()) \
                 > REPORT_DATA_BYTES:
             errors.append({"field": "data", "message": "must be a JSON object of at most 16 KiB"})
         if errors:
             raise Problem(422, "the report is not valid", errors=errors)
+
+    def _subject(self, request, id: str) -> tuple[str, str, str]:
+        # "/api/v1/plugin-api/<kind>/..." or "/api/v1/<kind>/...", after the empty segment before the first "/".
+        segment = request.url.path.split("/")[4 if request.url.path.startswith(API + "/plugin-api") else 3]
+        kind = {"submissions": "submission", "assignments": "assignment", "courses": "course"}[segment]
+        sid = self._uuid(id, "id")
+        if kind == "course" and request.url.path.startswith(API + "/plugin-api"):
+            self._reach(sid)  # the grant is asked before the course is looked up
+        table = {"submission": self.submissions, "assignment": self.assignments, "course": self.courses}[kind]
+        subject = table.get(sid)
+        if subject is None:
+            raise Problem(404, "there is no such submitted attempt, assignment or course")
+        return kind, sid, subject["id"] if kind == "course" else subject["course_id"]
+
+    @staticmethod
+    def _key(key: str) -> None:
+        if not is_report_key(key):
+            raise Problem(422, "the key is not valid", errors=[{"field": "key", "message": "must be a slug"}])
+
+    def _put_report(self, request, body, id, key):
+        kind, sid, course_id = self._subject(request, id)
+        self._reach(course_id)
+        self._key(key)  # after the subject, as in the core
         if (kind, sid, key) not in self._reports and len(self.reports_for(kind, sid)) >= MAX_REPORTS_PER_SUBJECT:
             raise Problem(422, f"a plugin may keep at most {MAX_REPORTS_PER_SUBJECT} reports on one subject",
                           errors=[{"field": "key", "message": "too many reports"}])
-        self._reports[(kind, sid, key)] = {"summary": body["summary"], "data": data,
+        self._reports[(kind, sid, key)] = {"summary": body["summary"], "data": body["data"],
                                            "updated_at": clock.iso(clock.now())}
         return 204, None, {}
 
     def _delete_report(self, request, _body, id, key):
-        if not is_report_key(key):
-            raise Problem(422, "the key is not valid", errors=[{"field": "key", "message": "must be a slug"}])
         kind, sid, course_id = self._subject(request, id)
         self._reach(course_id)
+        self._key(key)
         if self._reports.pop((kind, sid, key), None) is None:
             raise Problem(404, "there is no such report")
         return 204, None, {}
@@ -607,7 +646,14 @@ class FakeCore:
 
     # -- mail (Contract 1) --
 
+    @classmethod
+    def _early_mail(cls, request, body) -> None:
+        cls._check_mail(body)  # the body is read before the scope is asked for
+
     def _mail(self, request, body):
+        """In the order of the core's handler: body (422), scope (403), `[mail]` (503), the target (404, 403, 422 for
+        an audience over `max_audience`), the hourly limit of calls (429), then per person: opt-out, the daily limit
+        (an audience skips the person as `rate_limited`, one person is a 429), the dedupe claim."""
         if not self.mail_configured:
             raise Problem(503, "mail is not configured")
         to = self._check_mail(body)
@@ -628,10 +674,15 @@ class FakeCore:
             people = [self.users[m["user_id"]] for m in self.members
                       if m["course_id"] == course_id and m["role"] in roles]
         limits = self.mail_limits
-        if len(people) > limits["audience"]:
-            raise Problem(429, "the audience is larger than one call may reach", {"retry-after": "3600"})
-        reasons = {"opted_out": 0, "no_address": 0, "duplicate": 0, "disabled": 0}
-        sending = []
+        if len(people) > limits["max_audience"]:
+            raise Problem(422, "the audience is larger than one call may reach",
+                          errors=[{"field": "to", "message": f"more than {limits['max_audience']} people"}])
+        recent_calls = [at for at in self._mail_calls if at > now - timedelta(hours=1)]
+        if len(recent_calls) >= limits["plugin_hourly_calls"]:
+            wait = math.ceil((min(recent_calls) + timedelta(hours=1) - now).total_seconds())
+            raise Problem(429, "the plugin made too many mail calls this hour", {"retry-after": str(wait)})
+        reasons = {"opted_out": 0, "no_address": 0, "duplicate": 0, "disabled": 0, "rate_limited": 0}
+        candidates = []
         for person in people:
             if person["status"] != "active":
                 reasons["disabled"] += 1
@@ -639,17 +690,26 @@ class FakeCore:
                 reasons["no_address"] += 1
             elif (person["id"], body["kind"]) in self.opt_outs:
                 reasons["opted_out"] += 1
-            elif self._is_duplicate(body.get("dedupe_key"), person["id"], now):
+            else:
+                candidates.append(person)
+        day = [m for m in self.mails if clock.parse_time(m["sent_at"]) > now - timedelta(days=1)]
+        over, rested = None, []
+        for person in candidates:
+            mine = [clock.parse_time(m["sent_at"]) for m in day if m["to_user_id"] == person["id"]]
+            if len(mine) >= limits["recipient_daily"]:
+                reasons["rate_limited"] += 1
+                over = math.ceil((min(mine) + timedelta(days=1) - now).total_seconds())
+            else:
+                rested.append(person)
+        if over is not None and "user_id" in to:
+            raise Problem(429, "a recipient got too much plugin mail today", {"retry-after": str(over)})
+        sending = []
+        for person in rested:
+            if self._is_duplicate(body.get("dedupe_key"), person["id"], now):
                 reasons["duplicate"] += 1
             else:
                 sending.append(person)
-        hour = [m for m in self.mails if clock.parse_time(m["sent_at"]) > now - timedelta(hours=1)]
-        if len(hour) + len(sending) > limits["per_plugin_hour"]:
-            raise Problem(429, "the plugin sent too much mail this hour", {"retry-after": "3600"})
-        day = [m for m in self.mails if clock.parse_time(m["sent_at"]) > now - timedelta(days=1)]
-        for person in sending:
-            if sum(m["to_user_id"] == person["id"] for m in day) >= limits["per_recipient_day"]:
-                raise Problem(429, "a recipient got too much plugin mail today", {"retry-after": "86400"})
+        self._mail_calls.append(now)
         for person in sending:
             self.mails.append({"plugin": self.plugin_id, "to_user_id": person["id"], "course_id": course_id,
                                "kind": body["kind"], "subject": body["subject"], "text": body["text"],
@@ -690,14 +750,20 @@ class FakeCore:
                 or any(unicodedata.category(c) == "Cc" for c in subject):
             bad("subject", "must be 1 to 200 characters without control characters")
         text = body.get("text")
-        if not isinstance(text, str) or not 1 <= len(text) <= 20000:
-            bad("text", "must be 1 to 20000 characters")
+        if not isinstance(text, str) or not 1 <= len(text) <= 20000 \
+                or any(unicodedata.category(c) == "Cc" and c not in "\n\r\t" for c in text):
+            bad("text", "must be 1 to 20000 characters of plain text, no control character but line breaks and tabs")
         link = body.get("link_path")
-        if link is not None and not (isinstance(link, str) and link.startswith("/") and not link.startswith("//")):
-            bad("link_path", "must be a path that starts with one `/`")
+        if link is not None and not (
+            isinstance(link, str) and len(link.encode()) <= 500 and link.startswith("/") and "//" not in link
+            and "\\" not in link and not any(c.isspace() or unicodedata.category(c) == "Cc" for c in link)
+        ):
+            bad("link_path", "must be a path of at most 500 characters: one leading /, no //, no backslash, "
+                             "no whitespace")
         key = body.get("dedupe_key")
-        if key is not None and not (isinstance(key, str) and 1 <= len(key) <= 100):
-            bad("dedupe_key", "must be at most 100 characters")
+        if key is not None and not (isinstance(key, str) and 1 <= len(key) <= 100
+                                    and not any(unicodedata.category(c) == "Cc" for c in key)):
+            bad("dedupe_key", "must be 1 to 100 printable characters")
         if set(body) - {"to", "kind", "subject", "text", "link_path", "dedupe_key"}:
             bad("body", "has fields the core does not know")
         if errors:
@@ -735,6 +801,10 @@ class FakeCore:
         The core sends only subscribed events; `force=True` sends one anyway."""
         if not force and event_type not in plugin.manifest()["subscribes"]:
             raise AssertionError(f"the core would not send {event_type}: the plugin does not subscribe to it")
+        course_id = data.get("course_id")
+        if not force and isinstance(course_id, str) and not self._reaches(course_id):
+            raise AssertionError(f"the core would not send an event about course {course_id}: the plugin does not "
+                                 "reach that course (`fake.grant(courses=...)`)")
         body, headers = signed_event(self.secret, event_type, data, event_id=event_id, **tamper)
         async with self._plugin_http(plugin) as http:
             response = await http.post("/events", content=body, headers=headers)
@@ -752,7 +822,9 @@ class FakeCore:
         route_path, _, query = path.partition("?")
         spec, params = self._match(plugin.manifest()["routes"], method.upper(), route_path)
         if spec is None:
-            return httpx.Response(404, json=Problem(404, "no such route").body())
+            # A stranger is asked for a session before anything is said about what exists (proxy.rs).
+            return httpx.Response(401 if user is None else 404, json=Problem(
+                401 if user is None else 404, "not logged in" if user is None else "no such route").body())
         body = content if content is not None else (b"" if json is None else
                                                       __import__("json").dumps(json, separators=(",", ":")).encode())
         who: dict[str, str | None] = {}
@@ -808,8 +880,9 @@ class FakeCore:
 
     @staticmethod
     def _check_answer(response: httpx.Response) -> None:
-        if not (200 <= response.status_code < 500):
-            raise AssertionError(f"the core would answer 502: the plugin answered {response.status_code}")
+        if not (200 <= response.status_code < 300 or 400 <= response.status_code < 500):
+            raise AssertionError(f"the core would answer 502: the plugin answered {response.status_code} "
+                                 "(only 2xx and 4xx are passed on, a redirect is not)")
         if response.content:
             media = response.headers.get("content-type", "").split(";")[0].strip().lower()
             if media not in ANSWER_TYPES:

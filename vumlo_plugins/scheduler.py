@@ -3,6 +3,7 @@ and can be run once on demand through the plugin's `POST /jobs/{name}` route, so
 
 from __future__ import annotations
 
+import asyncio
 import os
 import re
 from collections.abc import Awaitable, Callable
@@ -32,6 +33,7 @@ class Scheduler:
         self._log = log
         self._timezone = timezone or os.getenv("VUMLO_TZ", "UTC")
         self.jobs: dict[str, Job] = {}
+        self._locks: dict[str, tuple[asyncio.AbstractEventLoop, asyncio.Lock]] = {}
         self._scheduler: AsyncIOScheduler | None = None
 
     def add(self, name: str, fn: JobFn, *, cron: str | None = None, every: float | None = None) -> None:
@@ -43,21 +45,33 @@ class Scheduler:
             raise ValueError(f"job {name} is declared twice")
         if cron and every:
             raise ValueError("a job runs on a cron line or every so many seconds, not both")
+        if every is not None and not every > 0:
+            raise ValueError("`every` is a positive number of seconds")
         if cron:
             CronTrigger.from_crontab(cron, timezone=self._timezone)  # fail at import, not at 06:00
         self.jobs[name] = Job(name, fn, cron, every)
 
+    def _lock(self, name: str) -> asyncio.Lock:
+        """One lock per job and event loop (a lock belongs to the loop it first waits in; tests make many loops)."""
+        loop = asyncio.get_running_loop()
+        held = self._locks.get(name)
+        if held is None or held[0] is not loop:
+            held = self._locks[name] = (loop, asyncio.Lock())
+        return held[1]
+
     async def run(self, name: str) -> dict[str, Any]:
         """Runs a job once now. The result is `{"job", "ok", ...what the job returned}`; an exception is logged and
-        reported as `ok: false` with its type."""
+        reported as `ok: false` with its type. A job never runs twice at once (the clock and an operator's
+        `POST /jobs/{name}` can meet): the second call waits for the first, then runs, which idempotent jobs allow."""
         job = self.jobs[name]
-        try:
-            result = await job.fn()
-        except Exception as error:
-            self._log.exception("job failed", job=name)
-            return {"job": name, "ok": False, "error": type(error).__name__}
+        async with self._lock(name):
+            try:
+                result = await job.fn()
+            except Exception as error:
+                self._log.exception("job failed", job=name)
+                return {"job": name, "ok": False, "error": type(error).__name__}
         self._log.info("job done", job=name)
-        return {"job": name, "ok": True, **(result or {})}
+        return {**(result if isinstance(result, dict) else {}), "job": name, "ok": True}
 
     def start(self) -> None:
         if self._scheduler is not None or not any(j.cron or j.every for j in self.jobs.values()):

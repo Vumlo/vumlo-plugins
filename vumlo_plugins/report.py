@@ -15,7 +15,7 @@ from decimal import Decimal
 from typing import Any
 
 LEVELS = ("ok", "info", "warn", "alert")
-MAX_SUMMARY = 500
+MAX_SUMMARY = 500  # bytes of UTF-8, as the core counts
 MAX_TITLE = 80
 MAX_ROWS = 200
 MAX_FACTS = 20
@@ -27,6 +27,14 @@ PLUGIN_PATH = "/api/v1/plugins/{plugin_id}"
 def _text(value: Any, limit: int) -> str:
     text = "".join(" " if unicodedata.category(c) == "Cc" else c for c in str(value))
     return text if len(text) <= limit else text[: limit - 1] + "…"
+
+
+def cut_bytes(text: str, limit: int) -> str:
+    """At most `limit` UTF-8 bytes, ending in `…` when cut. The core counts a summary in bytes (garde `length` on a
+    String), so Cyrillic text gets 250 characters, not 500."""
+    if len(text.encode()) <= limit:
+        return text
+    return text.encode()[: limit - 3].decode("utf-8", "ignore").rstrip() + "…"
 
 
 def _cell(value: Any) -> str | int | float:
@@ -66,7 +74,7 @@ class Report:
         """`links` are `(title, path)`: the path on the plugin's own server (`/export/<course>/xlsx`), which this
         turns into the path through the core, `/api/v1/plugins/<plugin_id>/export/...`. `data` is anything else a
         program may want; `display` is reserved."""
-        summary = _text(summary, MAX_SUMMARY).strip()
+        summary = cut_bytes(_text(summary, MAX_SUMMARY), MAX_SUMMARY).strip()
         if not summary:
             raise ValueError("a report needs a summary")
         extra = dict(data or {})

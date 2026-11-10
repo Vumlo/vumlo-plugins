@@ -8,6 +8,7 @@ back-off (not a POST: the one POST, mail, is retried only on 429, and `dedupe_ke
 from __future__ import annotations
 
 import asyncio
+import math
 import os
 import re
 import unicodedata
@@ -20,7 +21,8 @@ from uuid import UUID
 import httpx
 
 from . import clock
-from .errors import CoreError, Unreachable, error_for
+from .errors import CoreError, ServerError, Unreachable, error_for
+from .logs import protect
 from .manifest import is_report_key
 from .report import MAX_DATA_BYTES, MAX_SUMMARY, Report, json_size
 
@@ -38,10 +40,21 @@ def _param(value: Any) -> str:
 
 
 def _retry_after(response: httpx.Response) -> float | None:
+    """Seconds the core asks to wait; `None` when it says nothing usable (an HTTP date, `nan`, junk)."""
     try:
-        return max(float(response.headers.get("retry-after", "")), 0.0)
+        seconds = float(response.headers.get("retry-after", ""))
     except ValueError:
         return None
+    return None if math.isnan(seconds) else max(seconds, 0.0)
+
+
+def _id(value: Any) -> str:
+    """An id that goes into a path: a UUID, normalised. Anything else (`../x`, `a/b`, `1?x`) is refused before any
+    request is made, so a value that came from a person cannot steer a call of the plugin's token."""
+    try:
+        return str(UUID(str(value)))
+    except ValueError:
+        raise ValueError("an id is a UUID") from None
 
 
 class PluginClient:
@@ -52,6 +65,7 @@ class PluginClient:
     ):
         self.base_url = (base_url if base_url is not None else os.getenv("VUMLO_API", "")).rstrip("/")
         self._token = token if token is not None else os.getenv("VUMLO_PLUGIN_TOKEN", "")
+        protect(self._token)
         self.max_retries = max_retries
         self._sleep = sleep
         self._http = httpx.AsyncClient(timeout=timeout, transport=transport)
@@ -64,6 +78,8 @@ class PluginClient:
     # -- plumbing ---------------------------------------------------------------------------------------------
 
     async def request(self, method: str, path: str, *, params: dict[str, Any] | None = None, json: Any = None) -> Any:
+        if not self.base_url:
+            raise Unreachable(0, {"detail": "VUMLO_API is not set"})
         query = {k: _param(v) for k, v in (params or {}).items() if v is not None}
         headers = {"Authorization": f"Bearer {self._token}"}
         url = f"{self.base_url}{path}"
@@ -72,20 +88,25 @@ class PluginClient:
             try:
                 response = await self._http.request(method, url, params=query, json=json, headers=headers)
             except httpx.TransportError as error:
-                if method == "POST" or attempt >= self.max_retries:
+                # A POST is sent again only when it never left (the core did not take it, so nothing can double).
+                resend = method != "POST" or isinstance(error, (httpx.ConnectError, httpx.ConnectTimeout))
+                if not resend or attempt >= self.max_retries:
                     raise Unreachable(0, {"detail": type(error).__name__}) from None
                 await self._sleep(min(0.5 * 2**attempt, MAX_RETRY_AFTER))
                 attempt += 1
                 continue
             status = response.status_code
-            if status < 400:
-                return response.json() if response.content else None
+            if status < 300:
+                try:
+                    return response.json() if response.content else None
+                except ValueError:
+                    raise ServerError(status, {"detail": "the answer is not JSON"}) from None
             try:
                 problem = response.json()
             except ValueError:
                 problem = {}
             problem_retry = _retry_after(response)
-            retryable = status == 429 or (status >= 500 and method != "POST")
+            retryable = status == 429 or (status >= 500 and method != "POST")  # 3xx: httpx follows none; an error
             # A wait longer than a minute is not slept through inside a request: the caller gets `RateLimited` with
             # `retry_after` and a job tries again on its next run.
             patient = problem_retry is None or problem_retry <= MAX_RETRY_AFTER
@@ -104,8 +125,10 @@ class PluginClient:
             for item in page.get("items", []):
                 yield item
             cursor = page.get("next_cursor")
-            if not cursor or cursor in seen:
+            if not cursor:
                 return
+            if cursor in seen:  # the core would send these items for ever; a cut list would be taken for the whole
+                raise CoreError(0, {"detail": "the cursor repeats"})
             seen.add(cursor)
             query["cursor"] = cursor
         raise CoreError(0, {"detail": "too many pages"})
@@ -119,7 +142,7 @@ class PluginClient:
         return await self.all("/plugin-api/assignments", course_id=course_id, updated_since=updated_since)
 
     async def assignment(self, assignment_id: str | UUID) -> dict[str, Any]:
-        return await self.request("GET", f"/plugin-api/assignments/{assignment_id}")
+        return await self.request("GET", f"/plugin-api/assignments/{_id(assignment_id)}")
 
     async def deleted_assignments(self, deleted_since: datetime | str, course_id: str | UUID | None = None):
         """Raises `Gone` when `deleted_since` is older than the core's retention: read `assignments()` in full."""
@@ -127,16 +150,16 @@ class PluginClient:
 
     async def submissions(self, assignment_id: str | UUID, *, updated_since: datetime | str | None = None):
         """Submitted attempts of an assignment, without content."""
-        return await self.all(f"/plugin-api/assignments/{assignment_id}/submissions", updated_since=updated_since)
+        return await self.all(f"/plugin-api/assignments/{_id(assignment_id)}/submissions", updated_since=updated_since)
 
     async def submission(self, submission_id: str | UUID) -> dict[str, Any]:
-        return await self.request("GET", f"/plugin-api/submissions/{submission_id}")
+        return await self.request("GET", f"/plugin-api/submissions/{_id(submission_id)}")
 
     async def form_answers(self, submission_id: str | UUID) -> dict[str, Any]:
-        return await self.request("GET", f"/plugin-api/submissions/{submission_id}/fields")
+        return await self.request("GET", f"/plugin-api/submissions/{_id(submission_id)}/fields")
 
     async def members(self, course_id: str | UUID, role: str | None = None) -> list[dict[str, Any]]:
-        return await self.all(f"/plugin-api/courses/{course_id}/members", role=role)
+        return await self.all(f"/plugin-api/courses/{_id(course_id)}/members", role=role)
 
     async def grades(
         self, course_id: str | UUID | None = None, assignment_id: str | UUID | None = None, *,
@@ -146,10 +169,10 @@ class PluginClient:
                               updated_since=updated_since)
 
     async def quiz(self, assignment_id: str | UUID) -> dict[str, Any]:
-        return await self.request("GET", f"/plugin-api/assignments/{assignment_id}/quiz")
+        return await self.request("GET", f"/plugin-api/assignments/{_id(assignment_id)}/quiz")
 
     async def attempts(self, assignment_id: str | UUID, *, updated_since: datetime | str | None = None):
-        return await self.all(f"/plugin-api/assignments/{assignment_id}/attempts", updated_since=updated_since)
+        return await self.all(f"/plugin-api/assignments/{_id(assignment_id)}/attempts", updated_since=updated_since)
 
     async def announcements(self, course_id: str | UUID | None = None, *, updated_since: datetime | str | None = None):
         return await self.all("/plugin-api/announcements", course_id=course_id, updated_since=updated_since)
@@ -174,13 +197,13 @@ class Reports:
             raise ValueError("subject is submission, assignment or course")
         if not is_report_key(key):
             raise ValueError("a report key is lowercase letters, digits, `_` and `-`, starts with a letter, <= 40")
-        return f"/plugin-api/{_SUBJECT_PATH[subject]}/{subject_id}/reports/{key}"
+        return f"/plugin-api/{_SUBJECT_PATH[subject]}/{_id(subject_id)}/reports/{key}"
 
     async def put(self, subject: Subject, subject_id: str | UUID, key: str, report: Report) -> None:
         """Replaces the plugin's report under `key`; sending the same twice leaves one."""
         path = self._path(subject, subject_id, key)
-        if not 1 <= len(report.summary) <= MAX_SUMMARY or json_size(report.data) > MAX_DATA_BYTES:
-            raise ValueError("the summary is 1 to 500 characters and the data at most 16 KiB; use Report.build")
+        if not 1 <= len(report.summary.encode()) <= MAX_SUMMARY or json_size(report.data) > MAX_DATA_BYTES:
+            raise ValueError("the summary is 1 to 500 bytes of UTF-8 and the data at most 16 KiB; use Report.build")
         await self._client.request("PUT", path, json=report.body())
 
     async def delete(self, subject: Subject, subject_id: str | UUID, key: str) -> None:
@@ -217,13 +240,19 @@ class Mail:
             raise ValueError("kind is a slug of at most 40 characters")
         if not 1 <= len(subject) <= 200 or any(unicodedata.category(c) == "Cc" for c in subject):
             raise ValueError("subject is 1 to 200 characters without control characters")
-        if not 1 <= len(text) <= 20000:
-            raise ValueError("text is 1 to 20000 characters")
-        if link_path is not None and not (link_path.startswith("/") and not link_path.startswith("//")):
-            raise ValueError("link_path is a path starting with one `/`")
-        if dedupe_key is not None and not 1 <= len(dedupe_key) <= 100:
-            raise ValueError("dedupe_key is at most 100 characters")
-        to = {"user_id": str(user_id)} if user_id is not None else {"course_id": str(course_id), "audience": audience}
+        if not 1 <= len(text) <= 20000 or any(unicodedata.category(c) == "Cc" and c not in "\n\r\t" for c in text):
+            raise ValueError("text is 1 to 20000 characters, with no control character but line breaks and tabs")
+        if link_path is not None and not (
+            link_path.startswith("/") and "//" not in link_path and len(link_path) <= 500
+            and ".." not in link_path.split("/") and all(0x21 <= ord(c) <= 0x7E for c in link_path)
+            and "\\" not in link_path
+        ):
+            raise ValueError("link_path is a plain path of at most 500 characters starting with one `/`, no `//`")
+        if dedupe_key is not None and (
+            not 1 <= len(dedupe_key) <= 100 or any(unicodedata.category(c) == "Cc" for c in dedupe_key)
+        ):
+            raise ValueError("dedupe_key is 1 to 100 printable characters")
+        to = {"user_id": _id(user_id)} if user_id is not None else {"course_id": _id(course_id), "audience": audience}
         body: dict[str, Any] = {"to": to, "kind": kind, "subject": subject, "text": text}
         if link_path is not None:
             body["link_path"] = link_path

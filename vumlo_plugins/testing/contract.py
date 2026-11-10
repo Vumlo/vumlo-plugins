@@ -49,9 +49,10 @@ MAIL_RESPONSE = {
     "properties": {
         "accepted": {"type": "integer", "minimum": 0}, "skipped": {"type": "integer", "minimum": 0},
         "skipped_reasons": {"type": "object", "additionalProperties": False,
-                            "required": ["opted_out", "no_address", "duplicate", "disabled"],
+                            "required": ["opted_out", "no_address", "duplicate", "disabled", "rate_limited"],
                             "properties": {k: {"type": "integer", "minimum": 0}
-                                           for k in ("opted_out", "no_address", "duplicate", "disabled")}},
+                                           for k in ("opted_out", "no_address", "duplicate", "disabled",
+                                                     "rate_limited")}},
     },
 }
 

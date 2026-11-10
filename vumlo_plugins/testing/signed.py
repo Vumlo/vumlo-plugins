@@ -32,7 +32,7 @@ def signed_call_headers(
 ) -> dict[str, str]:
     """The headers the core adds to a call it forwards (proxy.rs). `user=None` is a public route (anyone)."""
     stamp = clock.timestamp() if timestamp is None else timestamp
-    nonce = nonce or str(uuid.uuid4())
+    nonce = str(uuid.uuid4()) if nonce is None else nonce  # "" is allowed: a test of the refusal of an empty one
     headers = {
         "x-vumlo-timestamp": str(stamp), "x-vumlo-nonce": nonce,
         "x-vumlo-signature": proxy_signature(secret, stamp, nonce=nonce, method=method, target=target, user=user,
