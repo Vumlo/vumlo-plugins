@@ -2,8 +2,8 @@ FROM python:3.12-slim
 
 # Required: directory name of the plugin to serve, e.g. text-metrics.
 ARG PLUGIN
-# Optional space-separated apt packages (pdf-optimizer needs
-# "ocrmypdf tesseract-ocr tesseract-ocr-eng tesseract-ocr-ukr ghostscript").
+# Optional space-separated apt packages, normally the contents of <plugin>/apt-packages.txt
+# (no plugin of the catalog needs any today).
 ARG APT_PACKAGES=""
 
 RUN test -n "$PLUGIN" || { echo "error: build arg PLUGIN is required, e.g. --build-arg PLUGIN=text-metrics" >&2; exit 1; }
