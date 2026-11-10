@@ -21,7 +21,7 @@ from uuid import UUID
 import httpx
 
 from . import clock
-from .errors import CoreError, ServerError, Unreachable, error_for
+from .errors import CoreError, NotFound, ServerError, Unreachable, error_for
 from .logs import protect
 from .manifest import is_report_key
 from .report import MAX_DATA_BYTES, MAX_SUMMARY, Report, json_size
@@ -64,7 +64,7 @@ class PluginClient:
         sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
     ):
         self.base_url = (base_url if base_url is not None else os.getenv("VUMLO_API", "")).rstrip("/")
-        self._token = token if token is not None else os.getenv("VUMLO_PLUGIN_TOKEN", "")
+        self._token = (token if token is not None else os.getenv("VUMLO_PLUGIN_TOKEN", "")).strip()
         protect(self._token)
         self.max_retries = max_retries
         self._sleep = sleep
@@ -206,8 +206,14 @@ class Reports:
             raise ValueError("the summary is 1 to 500 bytes of UTF-8 and the data at most 16 KiB; use Report.build")
         await self._client.request("PUT", path, json=report.body())
 
-    async def delete(self, subject: Subject, subject_id: str | UUID, key: str) -> None:
-        await self._client.request("DELETE", self._path(subject, subject_id, key))
+    async def delete(self, subject: Subject, subject_id: str | UUID, key: str) -> bool:
+        """Leaves no report under `key`. `False` when there was none (or no such subject): a DELETE that was retried
+        after its answer got lost finds nothing the second time, and that is a success, not an error."""
+        try:
+            await self._client.request("DELETE", self._path(subject, subject_id, key))
+        except NotFound:
+            return False
+        return True
 
 
 @dataclass

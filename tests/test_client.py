@@ -222,10 +222,10 @@ async def test_a_report_is_replaced_not_piled_up_and_can_be_deleted(world):
     assert fake.report("submission", sub, "text-metrics")["summary"] == "2 words"
     await client.reports.put("assignment", work["id"], "a", Report.build("x"))
     await client.reports.put("course", course["id"], "c", Report.build("x"))
-    await client.reports.delete("submission", sub["id"], "text-metrics")
+    assert await client.reports.delete("submission", sub["id"], "text-metrics") is True
     assert fake.report("submission", sub, "text-metrics") is None
-    with pytest.raises(NotFound):
-        await client.reports.delete("submission", sub["id"], "text-metrics")
+    # Nothing left to delete is a success too: a DELETE retried after a lost answer finds nothing the second time.
+    assert await client.reports.delete("submission", sub["id"], "text-metrics") is False
 
 
 async def test_report_arguments_are_checked_before_anything_is_sent(world):

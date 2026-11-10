@@ -14,6 +14,7 @@ from typing import Any
 from . import clock
 from .client import PluginClient
 from .errors import CoreError
+from .logs import protect
 from .manifest import check_setting_value
 
 
@@ -48,11 +49,15 @@ class SettingsReader:
             if not isinstance(remote, dict):
                 raise CoreError(0, {"detail": "settings are not an object"})
         except (CoreError, KeyError, TypeError):
-            return values  # not cached: the next call asks again
+            # Not cached, so the next call asks again. What was last known beats the defaults: an administrator's
+            # threshold or webhook filter must not silently turn into the shipped one because the core hiccupped.
+            return dict(hit[1]) if hit else values
         for name, value in remote.items():
             spec = self._specs.get(name)
             if spec is not None and check_setting_value(spec, value) is None:
                 values[name] = value
+                if spec.get("secret"):
+                    protect(value)  # a secret the administrator typed never reaches a log line
         if generation == self._generation:
             self._cache[key] = (now + self._ttl, values)
         return dict(values)

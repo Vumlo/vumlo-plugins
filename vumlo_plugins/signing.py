@@ -119,8 +119,12 @@ class NonceStore:
         self._limit = limit
 
     def take(self, nonce: str, now: float) -> None:
-        for old in [n for n, at in self._seen.items() if now - at > 2 * MAX_AGE_SECONDS]:
-            del self._seen[old]
+        # Oldest first (insertion order), so only the expired front is visited, not all of them on every call.
+        while self._seen:
+            oldest = next(iter(self._seen))
+            if now - self._seen[oldest] <= 2 * MAX_AGE_SECONDS:
+                break
+            del self._seen[oldest]
         if nonce in self._seen:
             raise Refused(401, "a call seen before")
         if len(self._seen) >= self._limit:

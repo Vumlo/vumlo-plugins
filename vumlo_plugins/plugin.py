@@ -27,7 +27,9 @@ from datetime import datetime
 from typing import Any
 
 from fastapi import FastAPI, Request, Response
+from fastapi.encoders import jsonable_encoder
 from fastapi.responses import JSONResponse, PlainTextResponse
+from starlette.exceptions import HTTPException
 
 from . import clock
 from .client import PluginClient
@@ -63,6 +65,28 @@ def attachment(content: bytes, filename: str, media_type: str) -> Response:
     return Response(content, media_type=media_type, headers={"Content-Disposition": f'attachment; filename="{safe}"'})
 
 
+MAX_ROUTE_BODY = 10 * 1024 * 1024  # what the core passes on from a person (proxy.rs MAX_REQUEST_BYTES)
+MAX_EVENT_BODY = 1024 * 1024
+SYNC_TIMEOUT = 4.0  # the core waits 5 s for an answer to an event
+
+
+async def _read(request: Request, limit: int) -> bytes:
+    """The body, refusing more than `limit` bytes before it is all in memory (the signature is checked after, so
+    anybody who can reach the port could otherwise make the plugin read what they like)."""
+    declared = request.headers.get("content-length", "")
+    if declared.isdigit() and int(declared) > limit:
+        raise Refused(413, "body too large")
+    chunks, size = [], 0
+    async for chunk in request.stream():
+        size += len(chunk)
+        if size > limit:
+            raise Refused(413, "body too large")
+        chunks.append(chunk)
+    body = b"".join(chunks)
+    request._body = body  # what `Request.body()` keeps, so a handler can read it again
+    return body
+
+
 Handler = Callable[[Event], Awaitable[None]]
 RouteHandler = Callable[..., Awaitable[Any]]
 
@@ -81,6 +105,7 @@ class Plugin:
         self._state: State | None = None
         self._secret: str | None = None
         self._handlers: dict[str, list[Handler]] = {}
+        self._sync: set[str] = set()
         self._routes: list[dict[str, Any]] = []
         self._nonces = NonceStore()
         self._tasks: set[asyncio.Task] = set()
@@ -109,7 +134,9 @@ class Plugin:
 
     @property
     def secret(self) -> str:
-        return self._secret if self._secret is not None else os.getenv("VUMLO_WEBHOOK_SECRET", "")
+        # Stripped: a secret pasted into an env file or read from a file often carries a newline, and that would
+        # make every signature fail for no visible reason.
+        return self._secret if self._secret is not None else os.getenv("VUMLO_WEBHOOK_SECRET", "").strip()
 
     def configure(self, *, client: PluginClient | None = None, state: State | None = None,
                   secret: str | None = None) -> None:
@@ -124,10 +151,15 @@ class Plugin:
 
     # -- declaring --------------------------------------------------------------------------------------------
 
-    def on(self, event_type: str) -> Callable[[Handler], Handler]:
-        """Subscribe to an event. The handler runs after the core got its 202; it must be idempotent."""
+    def on(self, event_type: str, *, sync: bool = False) -> Callable[[Handler], Handler]:
+        """Subscribe to an event. The handler runs after the core got its 202; it must be idempotent. A failure is
+        logged and the event is not redelivered (the core already has its 202): work that must not be lost is read
+        again by a job. With `sync=True` the handlers of this event type run before the answer instead: a failure (or
+        4 s without finishing) answers 502 and the core delivers the event again, as webhook-forwarder needs."""
         def decorate(fn: Handler) -> Handler:
             self._handlers.setdefault(event_type, []).append(fn)
+            if sync:
+                self._sync.add(event_type)
             return fn
         return decorate
 
@@ -172,23 +204,30 @@ class Plugin:
         self._routes.append(spec)
 
         async def endpoint(request: Request) -> Response:
-            body = await request.body()
             target = request.scope.get("raw_path", request.url.path.encode()).decode("latin-1")
             if request.scope.get("query_string"):
                 target += "?" + request.scope["query_string"].decode("latin-1")
             try:
+                body = await _read(request, MAX_ROUTE_BODY)
                 who = verify_proxy(self.secret, request.headers, body, method=request.method, target=target,
                                    nonces=self._nonces)
             except Refused as refused:
                 return JSONResponse({"error": refused.why}, status_code=refused.status)
             if not self._allowed(spec, who):
                 return JSONResponse({"error": "not allowed"}, status_code=403)
-            result = await fn(request, who, **request.path_params)
-            if isinstance(result, Response):
-                return result
-            if isinstance(result, str):
-                return PlainTextResponse(result)
-            return JSONResponse(result)
+            try:
+                result = await fn(request, who, **request.path_params)
+                if isinstance(result, Response):
+                    return result
+                if isinstance(result, str):
+                    return PlainTextResponse(result)
+                return JSONResponse(jsonable_encoder(result))
+            except HTTPException:
+                raise  # `raise HTTPException(404)` is how a handler says no
+            except Exception as error:
+                # Logged here, scrubbed, instead of by the server's own logger, which prints the raw message.
+                self.log.exception("route failed", route=spec["path"])
+                return JSONResponse({"error": "internal error", "type": type(error).__name__}, status_code=500)
 
         self.app.add_api_route(spec["path"], endpoint, methods=[spec["method"]], include_in_schema=False)
 
@@ -205,7 +244,7 @@ class Plugin:
         if name not in self.scheduler.jobs:
             return JSONResponse({"error": "no such job"}, status_code=404)
         result = await self.scheduler.run(name)
-        return JSONResponse(result, status_code=200 if result["ok"] else 500)
+        return JSONResponse(jsonable_encoder(result), status_code=200 if result["ok"] else 500)
 
     async def _manifest_endpoint(self) -> dict[str, Any]:
         return self.manifest()
@@ -216,8 +255,8 @@ class Plugin:
                 "events_handled": self._handled, "configured": configured}
 
     async def _events_endpoint(self, request: Request) -> Response:
-        body = await request.body()
         try:
+            body = await _read(request, MAX_EVENT_BODY)
             verify_event(self.secret, request.headers, body)
         except Refused as refused:
             return JSONResponse({"error": refused.why}, status_code=refused.status)
@@ -233,23 +272,32 @@ class Plugin:
         if event.type == SETTINGS_CHANGED:
             self.config.invalidate()
         if event.type in self._handlers and self.state.seen("events", event.id):
-            task = asyncio.create_task(self._dispatch(event))
-            self._tasks.add(task)
-            task.add_done_callback(self._tasks.discard)
+            if event.type in self._sync:
+                if not await self._dispatch(event, SYNC_TIMEOUT):
+                    return JSONResponse({"error": "the handler failed"}, status_code=502)
+            else:
+                task = asyncio.create_task(self._dispatch(event))
+                self._tasks.add(task)
+                task.add_done_callback(self._tasks.discard)
         return JSONResponse({}, status_code=202)
 
-    async def _dispatch(self, event: Event) -> None:
+    async def _dispatch(self, event: Event, timeout: float | None = None) -> bool:
         try:
-            for handler in self._handlers[event.type]:
-                await handler(event)
+            async with asyncio.timeout(timeout):
+                for handler in self._handlers[event.type]:
+                    await handler(event)
             self._handled += 1
             self.log.info("event handled", event_type=event.type, event_id=event.id)
+            ok = True
         except Exception:
-            # Forget the id so a redelivery is processed again; the failure is logged, not swallowed.
+            # Forget the id so a redelivery (when the core is told to send one: `sync`) is processed again; the
+            # failure is logged, not swallowed.
             self.state.delete("events", event.id)
             self.log.exception("event handler failed", event_type=event.type, event_id=event.id)
+            ok = False
         if self.state.seen("meta", f"pruned-{clock.timestamp() // 3600}"):
             self.state.prune("events", EVENT_MEMORY_SECONDS)
+        return ok
 
     async def drain(self) -> None:
         """Wait for the events being processed. The tests' way to see the work of a 202."""

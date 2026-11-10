@@ -669,3 +669,249 @@ async def test_a_report_with_a_bad_body_is_422_even_for_a_subject_that_does_not_
     with pytest.raises(CoreError) as caught:
         await client.request("PUT", f"/plugin-api/courses/{UUID_A}/reports/k", json={"summary": "s", "data": {}})
     assert caught.value.status == 404
+
+
+# ---- second round: the request path, mail rules, the order of the core's answers -----------------------------------
+
+
+async def test_a_sync_handler_that_fails_answers_502_and_the_redelivery_is_processed():
+    plugin = _plugin()
+    runs = []
+
+    @plugin.on("assignment.created", sync=True)
+    async def created(event):
+        runs.append(event.id)
+        if len(runs) == 1:
+            raise RuntimeError("downstream is down")
+
+    body, headers = signed_event(SECRET, "assignment.created", {}, event_id="e1")
+    async with _http(plugin) as http:
+        assert (await http.post("/events", content=body, headers=headers)).status_code == 502
+        assert (await http.post("/events", content=body, headers=headers)).status_code == 202
+        assert (await http.post("/events", content=body, headers=headers)).status_code == 202  # now a duplicate
+    assert runs == ["e1", "e1"]
+
+
+async def test_a_sync_handler_that_does_not_finish_in_time_answers_502(monkeypatch):
+    from vumlo_plugins import plugin as module
+    monkeypatch.setattr(module, "SYNC_TIMEOUT", 0.05)
+    plugin = _plugin()
+
+    @plugin.on("assignment.created", sync=True)
+    async def created(event):
+        await asyncio.sleep(5)
+
+    body, headers = signed_event(SECRET, "assignment.created", {}, event_id="slow")
+    async with _http(plugin) as http:
+        assert (await http.post("/events", content=body, headers=headers)).status_code == 502
+    assert plugin.state.items("events") == {}  # forgotten, so the core's next delivery runs
+
+
+async def test_a_body_over_the_limit_is_refused_before_it_is_read_and_a_handler_can_read_it_again(monkeypatch):
+    from vumlo_plugins import plugin as module
+    monkeypatch.setattr(module, "MAX_ROUTE_BODY", 100)
+    monkeypatch.setattr(module, "MAX_EVENT_BODY", 100)
+    plugin = _plugin()
+    async with _http(plugin) as http:
+        big = b"x" * 101
+        headers = signed_call_headers(SECRET, "POST", "/echo", user=UUID_A, role="admin", body=big)
+        assert (await http.post("/echo", content=big, headers=headers)).status_code == 413
+        async def chunked():  # no Content-Length: counted while it streams
+            for _ in range(2):
+                yield b"x" * 60
+
+        assert (await http.post("/echo", content=chunked(), headers=headers)).status_code == 413
+        body, headers = signed_event(SECRET, "x", {"pad": "y" * 200})
+        assert (await http.post("/events", content=body, headers=headers)).status_code == 413
+        small = b"x" * 100
+        headers = signed_call_headers(SECRET, "POST", "/echo", user=UUID_A, role="admin", body=small)
+        answer = await http.post("/echo", content=small, headers=headers)
+        assert answer.status_code == 200 and answer.json() == {"len": 100}  # the handler read the body again
+
+
+async def test_a_route_that_raises_is_logged_scrubbed_and_answers_500(capsys):
+    plugin = Plugin("boom")
+    token = "vplg_" + "R" * 43
+
+    @plugin.route("GET", "/boom", roles=["admin"])
+    async def boom(request, who):
+        raise RuntimeError(f"cannot write for olena@uni.edu.ua with {token}")
+
+    @plugin.route("GET", "/nope", roles=["admin"])
+    async def nope(request, who):
+        from fastapi import HTTPException
+        raise HTTPException(404, "no such thing")
+
+    @plugin.route("GET", "/when", roles=["admin"])
+    async def when(request, who):
+        import datetime
+        return {"at": datetime.datetime(2026, 3, 2, 12, tzinfo=datetime.UTC)}
+
+    plugin.configure(secret=SECRET, state=State(":memory:"))
+    async with _http(plugin) as http:
+        for path, status in (("/boom", 500), ("/nope", 404), ("/when", 200)):
+            headers = signed_call_headers(SECRET, "GET", path, user=UUID_A, role="admin")
+            assert (await http.get(path, headers=headers)).status_code == status, path
+    text = capsys.readouterr().out
+    assert "route failed" in text and "olena" not in text and token not in text
+
+
+async def test_a_job_result_with_a_time_in_it_is_still_an_answer():
+    import datetime
+    plugin = _plugin()
+
+    @plugin.job("when")
+    async def when():
+        return {"at": datetime.datetime(2026, 3, 2, 12, tzinfo=datetime.UTC)}
+
+    async with _http(plugin) as http:
+        headers = signed_call_headers(SECRET, "POST", "/jobs/when", user=UUID_A, role="admin")
+        answer = await http.post("/jobs/when", headers=headers)
+    assert answer.status_code == 200 and answer.json()["at"].startswith("2026-03-02")
+
+
+def test_the_nonce_store_forgets_the_old_ones_from_the_front_and_refuses_when_full():
+    from vumlo_plugins.signing import NonceStore
+    store = NonceStore(limit=3)
+    store.take("a", 0)
+    store.take("b", 100)
+    store.take("c", 200)
+    with pytest.raises(Refused) as full:
+        store.take("d", 300)
+    assert full.value.status == 503
+    store.take("d", 601)  # "a" is older than 600 s: forgotten, so there is room
+    with pytest.raises(Refused) as seen:
+        store.take("b", 601)  # "b" is still remembered
+    assert seen.value.status == 401
+
+
+def test_naive_times_are_utc_everywhere():
+    from datetime import datetime
+    assert clock.iso(datetime(2026, 3, 2, 12, 0, 0)) == "2026-03-02T12:00:00Z"
+
+
+# -- mail rules of the core (mail crate model.rs)
+
+@pytest.mark.parametrize("kwargs", [
+    dict(text="a\x00b"), dict(text="a\x1bb"), dict(text="x" * 20001), dict(text=""),
+    dict(dedupe_key="a\nb"), dict(dedupe_key="x" * 101),
+    dict(link_path="/a//b"), dict(link_path="/a?b=c d"), dict(link_path="/" + "a" * 500),
+])
+async def test_a_mail_the_core_would_refuse_is_refused_here_and_in_the_fake(fake, kwargs):
+    course = fake.add_course()
+    student = fake.add_user()
+    fake.enroll(course, student)
+    base = dict(kind="k", subject="s", text="t", user_id=student["id"])
+    with pytest.raises(ValueError):
+        await fake.client().mail.send(**{**base, **kwargs})
+    body = {"to": {"user_id": student["id"]}, "kind": "k", "subject": "s", "text": kwargs.get("text", "t")}
+    body.update({k: v for k, v in kwargs.items() if k != "text"})
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=fake.app), base_url="http://core") as http:
+        answer = await http.post("/api/v1/plugin-api/mail", json=body,
+                                 headers={"authorization": f"Bearer {fake.token}"})
+    assert answer.status_code == 422
+
+
+async def test_line_breaks_and_tabs_are_fine_in_the_text(fake):
+    course = fake.add_course()
+    student = fake.add_user()
+    fake.enroll(course, student)
+    answer = await fake.client().mail.send(kind="k", subject="s", text="line 1\r\n\tline 2", user_id=student["id"])
+    assert answer.accepted == 1
+
+
+async def test_a_bad_body_is_422_before_the_scope_is_checked_and_a_bad_key_is_404_for_a_missing_subject(fake):
+    """The core's extractors read the body before the handler asks for the scope or looks the subject up."""
+    fake.grant(scopes={"settings:read"})
+    client = fake.client()
+    with pytest.raises(CoreError) as caught:
+        await client.request("POST", "/plugin-api/mail", json={"to": 1})
+    assert caught.value.status == 422
+    with pytest.raises(CoreError) as caught:
+        await client.request("PUT", f"/plugin-api/courses/{UUID_A}/reports/k", json={"summary": "", "data": {}})
+    assert caught.value.status == 422
+    with pytest.raises(CoreError) as caught:  # a valid body, but no scope
+        await client.request("PUT", f"/plugin-api/courses/{UUID_A}/reports/k", json={"summary": "s", "data": {}})
+    assert caught.value.status == 403
+    fake.grant(scopes={"reports:write"})
+    with pytest.raises(CoreError) as caught:  # the key is looked at after the subject
+        await client.request("PUT", f"/plugin-api/courses/{UUID_A}/reports/Bad", json={"summary": "s", "data": {}})
+    assert caught.value.status == 404
+    course = fake.add_course()
+    with pytest.raises(CoreError) as caught:
+        await client.request("PUT", f"/plugin-api/courses/{course['id']}/reports/Bad", json={"summary": "s", "data": {}})
+    assert caught.value.status == 422
+
+
+async def test_a_course_outside_the_grant_is_403_even_when_it_does_not_exist_for_a_course_report(fake):
+    fake.grant(courses=[fake.add_course()])
+    with pytest.raises(CoreError) as caught:
+        await fake.client().request("PUT", f"/plugin-api/courses/{UUID_A}/reports/k", json={"summary": "s", "data": {}})
+    assert caught.value.status == 403  # `authorize_plugin_course` comes before `course_must_exist`
+
+
+async def test_the_fake_checks_what_the_plugin_sends_against_the_openapi(fake):
+    course = fake.add_course()
+    with pytest.raises(AssertionError, match="request"):
+        await fake.client().request("PUT", f"/plugin-api/courses/{course['id']}/reports/k",
+                                    json={"summary": "s", "data": {}, "colour": "red"})
+
+
+async def test_mail_hourly_limit_counts_calls_and_an_audience_over_the_limit_is_422(fake):
+    course = fake.add_course()
+    students = [fake.add_user() for _ in range(3)]
+    for s in students:
+        fake.enroll(course, s)
+    fake.mail_limits.update(plugin_hourly_calls=2, max_audience=2)
+    client = fake.client()
+    with pytest.raises(CoreError) as caught:
+        await client.mail.send(kind="k", course_id=course["id"], audience="students", subject="s", text="t")
+    assert caught.value.status == 422 and fake.mails == []
+    await client.mail.send(kind="k", course_id=course["id"], audience="teachers", subject="s", text="t")  # 0 people
+    await client.mail.send(kind="k", user_id=students[0]["id"], subject="s", text="t")
+    with pytest.raises(RateLimited) as limited:
+        await client.mail.send(kind="k", user_id=students[1]["id"], subject="s", text="t")
+    assert limited.value.retry_after == 3600
+
+
+async def test_a_post_that_may_have_reached_the_core_is_sent_once():
+    calls = []
+
+    def handler(request):
+        calls.append(1)
+        raise httpx.ReadError("reset", request=request)
+
+    client, _ = _client(handler)
+    with pytest.raises(Unreachable):
+        await client.mail.send(kind="k", subject="s", text="t", user_id=UUID_A)
+    assert len(calls) == 1
+
+
+async def test_when_the_core_fails_the_last_known_settings_beat_the_defaults(fake):
+    plugin = Plugin("stale", scopes=["settings:read"], settings={"n": setting("number", default=1)})
+    fake.attach(plugin)
+    fake.set_setting("n", 7)
+    assert (await plugin.config.get())["n"] == 7
+    clock.advance(seconds=301)  # the cache has expired
+    fake.fail("GET", "/plugin-api/settings", 503, times=50)
+    assert (await plugin.config.get())["n"] == 7
+    plugin.config.invalidate()  # after a change event nothing stale is served
+    assert (await plugin.config.get())["n"] == 1
+
+
+async def test_a_secret_setting_is_masked_in_the_log_once_it_was_read(fake, capsys):
+    plugin = Plugin("hook", scopes=["settings:read"], settings={"url": setting("string", secret=True)})
+    fake.attach(plugin)
+    fake.set_setting("url", "https://hooks.example.org/T0K3N-value")
+    assert (await plugin.config.get())["url"].startswith("https://")
+    plugin.log.info("posting to https://hooks.example.org/T0K3N-value failed")
+    assert "T0K3N" not in capsys.readouterr().out
+
+
+def test_a_secret_with_a_trailing_newline_from_the_environment_still_verifies(monkeypatch):
+    monkeypatch.setenv("VUMLO_WEBHOOK_SECRET", SECRET + "\n")
+    monkeypatch.setenv("VUMLO_PLUGIN_TOKEN", "vplg_abc\n")
+    plugin = Plugin("env")
+    body, headers = signed_event(SECRET, "x", {})
+    verify_event(plugin.secret, headers, body)
+    assert PluginClient("http://core/api/v1")._token == "vplg_abc"

@@ -34,7 +34,7 @@ def protect(*values: str) -> None:
 
 
 def scrub(text: str) -> str:
-    for secret in sorted(_protected | {os.environ.get(name, "") for name in ENV_SECRETS}, key=len, reverse=True):
+    for secret in sorted(_protected | {os.environ.get(name, "").strip() for name in ENV_SECRETS}, key=len, reverse=True):
         if len(secret) >= 6:
             text = text.replace(secret, "[secret]")
     for pattern, mask in _PATTERNS:

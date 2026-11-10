@@ -45,8 +45,12 @@ What you get without writing it:
 - `GET /manifest` built from what you declared (events, scopes, settings, routes) and **checked by a port of the core's
   validator** when the server starts and in tests: a manifest the core would refuse at `plugin install` stops here.
 - `POST /events`: verifies the signature and the age, records the event id, answers `202`, then runs your handler off the
-  request path. A redelivery of the same id is ignored; a handler that raises is logged and its id forgotten, so the
-  core's retry is processed again.
+  request path. A redelivery of the same id is ignored. The core has its `202` by then and sends nothing again, so a
+  handler that raises is logged (scrubbed) and that event is lost: read what must not be lost again in a job. When the
+  core must retry (a forwarder), declare `@plugin.on(type, sync=True)`: the handler runs before the answer, a failure or
+  4 s without finishing answers `502`, the id is forgotten and the core's redelivery is processed.
+- A route that raises is logged by the SDK (never by the server's own logger, which prints the raw message) and answers
+  `500` with the exception type. Bodies above 10 MiB (1 MiB for events) are refused before they are read.
 - Routes: every call is verified (signature over method, target, body, user, role, course, nonce; nonces are taken once)
   before your handler runs, and the signed roles are checked again. `auth="none"` is a public `GET` for which you check
   your own token.
@@ -61,9 +65,9 @@ Environment, printed by `vumlo-cli plugin install`: `VUMLO_API` (root with `/api
 | | |
 |---|---|
 | `plugin.client` | `assignments`, `assignment`, `submissions`, `submission`, `form_answers`, `members`, `grades`, `quiz`, `attempts`, `announcements`, `deleted_*`, `settings`; lists are followed through `next_cursor`; 429 is retried after `Retry-After`, 5xx with a back-off (never a `POST`); errors are typed (`Forbidden`, `NotFound`, `Gone`, `RateLimited`, `Unavailable`...), all `CoreError` |
-| `client.reports.put(kind, id, key, report)` / `.delete` | `kind` is `submission`, `assignment` or `course`; `key` is a slug of at most 40 characters; the same key replaces, the core keeps 20 per subject |
+| `client.reports.put(kind, id, key, report)` / `.delete` | `kind` is `submission`, `assignment` or `course`; `key` is a slug of at most 40 characters; the same key replaces, the core keeps 20 per subject; the summary is at most 500 **bytes** (the core counts bytes, so 250 Cyrillic letters); `delete` returns `False` when nothing was there |
 | `Report.build(summary, level=, title=, columns=, rows=, facts=, links=)` | the display convention v1 the web "Plugin reports" panel renders; rows are cut to 200 and to 16 KiB and say so; `links` are paths on your own server, made into `/api/v1/plugins/<id>/...` |
-| `client.mail.send(kind=, subject=, text=, user_id= or course_id= + audience=, link_path=, dedupe_key=)` | plain text; the plugin never sees an address; the same `dedupe_key` to the same person is accepted once in 30 days; the core adds the footer and the opt-out per `kind` |
+| `client.mail.send(kind=, subject=, text=, user_id= or course_id= + audience=, link_path=, dedupe_key=)` | plain text; the plugin never sees an address; the same `dedupe_key` to the same person is accepted once in 30 days; the core adds the footer and the opt-out per `kind`; `skipped_reasons` has `opted_out`, `no_address`, `duplicate`, `disabled`, `rate_limited`; one person over the daily limit is a `429`, in an audience they are skipped |
 | `plugin.config.get(course_id)` | settings with the defaults of the manifest, course over institution; cached, dropped on `plugin.settings.changed`; works with the core down |
 | `@plugin.job(name, cron=, every=)` | time-based work (APScheduler, started with the app); must be idempotent: use dedupe keys and `plugin.state` |
 | `plugin.state` | `State`: SQLite in WAL mode for caches and cursors, never the source of truth for core data |
@@ -110,12 +114,14 @@ async def test_a_long_work_is_reported_and_mailed():
 ```
 
 Useful knobs: `fake.grant(scopes=..., courses=[...])` (what the administrator granted), `fake.fail("GET", "/assignments", 503,
-times=2, retry_after=1)` (retries), `fake.mail_limits`, `fake.mail_configured = False`, `fake.opt_out(user, kind)`,
+times=2, retry_after=1)` (retries), `fake.mail_limits` (`plugin_hourly_calls`, `recipient_daily`, `max_audience`, the names of `[mail]`), `fake.mail_configured = False`, `fake.opt_out(user, kind)`,
 `clock.advance(days=1)`, `fake.calls` (what the plugin called), `fake.slept` (back-off waits, not really slept).
 
-`fake.call` does what the core does for a route: 404 for an undeclared route or an unreachable course, 401 without a
-session (unless `auth="none"`), 403 for a role or course role, and it fails your test where the core would answer `502`
-(a 5xx or a content type it does not pass on).
+`fake.call` does what the core does for a route: 401 without a session (also for a route that does not exist), 404 for an
+undeclared route or a course the person cannot see, 403 for a role, a course role or a course outside the grant, and it
+fails your test where the core would answer `502` (a 5xx, a redirect, or a content type it does not pass on).
+`fake.deliver` fails your test for an event the core would not send: one the plugin did not subscribe to, or one about a
+course outside the grant.
 
 ### The fake is checked against the core
 
