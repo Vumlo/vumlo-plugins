@@ -9,8 +9,9 @@ app = FastAPI(title="pdf-optimizer")
 
 @app.get("/manifest")
 def manifest():
-    return {"id": "pdf-optimizer", "version": "1.0.0", "api": "1", "subscribes": [], "scopes": [], "ui": [], "settings": {}, "routes": [{"method": "GET", "path": "/", "roles": ["teacher"]}, {"method": "POST", "path": "/optimize", "roles": ["teacher"]}]}
+    return {"id": "pdf-optimizer", "version": "1.0.0", "api": "1", "subscribes": [], "scopes": [], "ui": [], "settings": {}, "routes": [{"method": "POST", "path": "/optimize", "roles": ["teacher"]}]}
 
+# Not a route of the manifest: the core refuses the path "/" and passes on no HTML. For running the service on its own.
 @app.get("/")
 def upload_page():
     return """<!doctype html><title>PDF optimizer</title><form method=post action=/optimize enctype=multipart/form-data><input type=file name=pdf accept=application/pdf required><label><input type=checkbox name=ocr> OCR (ukr+eng)</label><button>Optimize</button></form>"""

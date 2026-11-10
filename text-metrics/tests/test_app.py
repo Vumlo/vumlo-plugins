@@ -9,6 +9,8 @@ def test_word_count(monkeypatch):
     client = Client()
     monkeypatch.setattr("app.client", client)
     process("submission.submitted", {"data": {"submission_id": "s", "course_id": "c"}})
-    assert client.args[1] == "3 words"
-    assert client.args[2]["minimum_ok"] is False
-    assert client.args[2]["maximum_ok"] is True
+    # report(subject, key, summary, data)
+    assert client.args[1] == "text_metrics"
+    assert client.args[2] == "3 words"
+    assert client.args[3]["minimum_ok"] is False
+    assert client.args[3]["maximum_ok"] is True

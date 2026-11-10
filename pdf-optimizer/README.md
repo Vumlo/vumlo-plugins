@@ -1,6 +1,7 @@
 # pdf-optimizer
 
-Standalone `POST /optimize` multipart service and minimal upload page at `/`.
+Standalone `POST /optimize` multipart service (the one route the manifest declares) and, only when it runs on its own,
+a minimal upload page at `/` (the core accepts no route `/` and serves no HTML).
 It uses OCRmyPDF/Tesseract with `ukr+eng` when OCR is selected; OCR is an
 option separate from optimization. The OCR backend is the `ocrmypdf` command.
 
