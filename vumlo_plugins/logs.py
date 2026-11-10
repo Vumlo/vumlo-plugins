@@ -47,6 +47,21 @@ class _Json(logging.Formatter):
         return json.dumps(line, ensure_ascii=False, default=str)
 
 
+class _Stdout(logging.StreamHandler):
+    """Writes to whatever `sys.stdout` is now, so a redirected or captured stdout sees the lines."""
+
+    def __init__(self):
+        super().__init__(sys.stdout)
+
+    @property
+    def stream(self):
+        return sys.stdout
+
+    @stream.setter
+    def stream(self, _value):
+        pass
+
+
 class Log:
     """`plugin.log.info("synced", assignments=12)`."""
 
@@ -54,7 +69,7 @@ class Log:
         self._logger = logging.getLogger(plugin_id)
         self._logger.propagate = False
         if not self._logger.handlers:
-            handler = logging.StreamHandler(stream or sys.stdout)
+            handler = logging.StreamHandler(stream) if stream else _Stdout()
             handler.setFormatter(_Json())
             self._logger.addHandler(handler)
             self._logger.setLevel(logging.INFO)

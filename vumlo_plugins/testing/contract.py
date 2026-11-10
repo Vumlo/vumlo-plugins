@@ -136,7 +136,8 @@ def check_response(method: str, template: str, status: int, body: Any) -> None:
         return
     declared = op["responses"].get(str(status))
     if declared is None:
-        if status == 429 or status >= 500:  # the guard layer and infrastructure answer these on every route
+        # The guard layer, infrastructure and axum's own rejection of a malformed path id answer on every route.
+        if status in (400, 429) or status >= 500:
             return
         raise AssertionError(f"{method} {template}: the core documents no {status} answer")
     schema = declared.get("content", {}).get("application/json", declared.get("content", {}).get(

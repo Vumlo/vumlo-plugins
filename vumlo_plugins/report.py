@@ -85,6 +85,8 @@ class Report:
         if links:
             if not plugin_id:
                 raise ValueError("links need the plugin_id")
+            if any(".." in p.split("/") or "\\" in p or "//" in p for _, p in links):
+                raise ValueError("a link path stays inside the plugin: no `..`, `//` or `\\`")
             prefix = PLUGIN_PATH.format(plugin_id=plugin_id)
             display["links"] = [{"title": _text(t, 60), "path": prefix + (p if p.startswith("/") else "/" + p)}
                                 for t, p in links]

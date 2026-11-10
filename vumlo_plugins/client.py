@@ -39,7 +39,7 @@ def _param(value: Any) -> str:
 
 def _retry_after(response: httpx.Response) -> float | None:
     try:
-        return min(max(float(response.headers.get("retry-after", "")), 0.0), MAX_RETRY_AFTER)
+        return max(float(response.headers.get("retry-after", "")), 0.0)
     except ValueError:
         return None
 
@@ -86,7 +86,10 @@ class PluginClient:
                 problem = {}
             problem_retry = _retry_after(response)
             retryable = status == 429 or (status >= 500 and method != "POST")
-            if retryable and attempt < self.max_retries:
+            # A wait longer than a minute is not slept through inside a request: the caller gets `RateLimited` with
+            # `retry_after` and a job tries again on its next run.
+            patient = problem_retry is None or problem_retry <= MAX_RETRY_AFTER
+            if retryable and patient and attempt < self.max_retries:
                 await self._sleep(problem_retry if problem_retry is not None else min(0.5 * 2**attempt, MAX_RETRY_AFTER))
                 attempt += 1
                 continue

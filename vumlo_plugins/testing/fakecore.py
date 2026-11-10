@@ -374,13 +374,14 @@ class FakeCore:
             raise Problem(401, "no token, or one that is unknown or disabled")
 
     def _uuid(self, text: str, name: str) -> str:
+        """A malformed id in the path is axum's `400` (the name `id`); in a query or body it is the core's `422`."""
         try:
             return str(uuid.UUID(text))
         except ValueError:
-            raise Problem(422, f"{name} is not a UUID") from None
+            raise Problem(400 if name == "id" else 422, f"{name} is not a UUID") from None
 
-    def _course(self, course_id: str) -> dict[str, Any]:
-        course = self.courses.get(self._uuid(course_id, "course_id"))
+    def _course(self, course_id: str, name: str = "course_id") -> dict[str, Any]:
+        course = self.courses.get(self._uuid(course_id, name))
         if course is None:
             raise Problem(404, "no such course")
         return course
@@ -510,7 +511,7 @@ class FakeCore:
         return self._page(request, rows, SUBMISSION_ITEM)
 
     def _members(self, request, _body, id):
-        course_id = self._course(id)["id"]
+        course_id = self._course(id, "id")["id"]
         self._reach(course_id)
         role = request.query_params.get("role")
         if role is not None and role not in ("teacher", "assistant", "student"):
@@ -558,7 +559,8 @@ class FakeCore:
     # -- reports --
 
     def _subject(self, request, id: str) -> tuple[str, str, str]:
-        segment = request.url.path.split("/")[3 if request.url.path.startswith(API + "/plugin-api") else 2]
+        # "/api/v1/plugin-api/<kind>/..." or "/api/v1/<kind>/...", after the empty segment before the first "/".
+        segment = request.url.path.split("/")[4 if request.url.path.startswith(API + "/plugin-api") else 3]
         kind = {"submissions": "submission", "assignments": "assignment", "courses": "course"}[segment]
         sid = self._uuid(id, "id")
         table = {"submission": self.submissions, "assignment": self.assignments, "course": self.courses}[kind]
