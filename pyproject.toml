@@ -1,29 +1,30 @@
 [project]
 name = "vumlo-plugins"
-version = "0.1.0"
-description = "Independent HTTP plugins for Vumlo LMS"
+version = "0.2.0"
+description = "Plugin SDK and catalog for Vumlo LMS"
 requires-python = ">=3.12"
 license = {text = "MIT"}
 dependencies = [
   "fastapi>=0.115,<1",
   "uvicorn[standard]>=0.30,<1",
   "httpx>=0.27,<1",
+  "apscheduler>=3.10,<4",
+  "tzdata>=2024.1",
   "icalendar>=6,<8",
   "openpyxl>=3.1,<4",
   "reportlab>=4,<5",
   "qrcode>=8,<9",
-  "apscheduler>=3.10,<4",
-  "ocrmypdf>=16,<18",
-  "python-multipart>=0.0.9,<1",
 ]
 
 [dependency-groups]
-dev = ["pytest>=8,<9", "pytest-asyncio>=0.23,<1"]
+dev = ["pytest>=8,<9", "pytest-asyncio>=0.23,<1", "jsonschema>=4.20,<5"]
 
 [tool.pytest.ini_options]
 pythonpath = ["."]
-testpaths = ["tests"]
-markers = ["integration: requires a live Vumlo core and PostgreSQL"]
+testpaths = ["tests", "*/tests"]
+addopts = "--import-mode=importlib"
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
 
 [tool.uv]
 default-groups = ["dev"]

@@ -1,22 +1,25 @@
 # vumlo-plugins
 
-Small independent Python 3.12 HTTP services for Vumlo LMS. Each directory is
-one deployable plugin. The shared `vumlo_plugins` package implements the
-Vumlo API version 1 manifest, HMAC event verification, replay-age checks,
-plugin API client, settings reads, and notifications.
+Small independent Python 3.12 HTTP services for Vumlo LMS, and the SDK they share. Each top-level directory with an
+`app.py` is one deployable plugin (`uvicorn <folder>.app:app`); `vumlo_plugins/` is the SDK.
 
-The contract was verified against `vumlo-core` ADR-0072 through ADR-0081,
-`examples/hello-plugin`, the generated OpenAPI, and
-`backend/crates/plugins`. The current contract includes nine signed event
-types, course-scoped installation with `--courses`, paginated plugin reads,
-tombstones, keyed report writes, and signed proxied routes. Plugins do not
-invent unavailable endpoints.
+**Writing a plugin: [vumlo_plugins/README.md](vumlo_plugins/README.md)** (a plugin in 30 lines, the client, reports,
+mail, jobs, and testing offline with `FakeCore`).
 
-Run with `uv sync`, then for example:
+The contract is the core's: ADR-0066 and ADR-0072 to 0082 in `vumlo-core/docs/decisions`, `backend/crates/plugins`, and
+its generated OpenAPI. The SDK signs and verifies exactly as `secret.rs` and `proxy.rs` do, ports the core's manifest
+validator, and `FakeCore` is checked against the OpenAPI, so a plugin's tests fail here before an install would fail there.
+
+## Develop
 
 ```sh
-VUMLO_WEBHOOK_SECRET=... uv run uvicorn webhook-forwarder.app:app --port 9000
+uv sync
+uv run pytest                      # all plugins and the SDK, offline
+VUMLO_WEBHOOK_SECRET=... uv run uvicorn text-metrics.app:app --port 9000
 ```
+
+Environment of a running plugin (printed by `vumlo-cli plugin install`): `VUMLO_API`, `VUMLO_PLUGIN_TOKEN`,
+`VUMLO_WEBHOOK_SECRET`; and `VUMLO_PLUGIN_DATA` for its small SQLite state (default `./data`).
 
 ## Run in Docker
 
@@ -24,27 +27,20 @@ One image per plugin; `PLUGIN` is the directory name and is required:
 
 ```sh
 docker build --build-arg PLUGIN=text-metrics -t vumlo-plugin-text-metrics .
-docker run --rm -p 8000:8000 \
-  -e VUMLO_API=http://core:8080 \
+docker run --rm -p 8000:8000 -v text-metrics-data:/data \
+  -e VUMLO_API=http://core:8080/api/v1 \
   -e VUMLO_PLUGIN_TOKEN=... \
   -e VUMLO_WEBHOOK_SECRET=... \
+  -e VUMLO_PLUGIN_DATA=/data \
   vumlo-plugin-text-metrics
 ```
 
-The container listens on port 8000 as a non-root user; `GET /manifest` returns
-the plugin manifest. Images carry no system packages by default. Only
-`pdf-optimizer` needs extra ones (OCR backend), passed via `APT_PACKAGES`:
-
-```sh
-docker build --build-arg PLUGIN=pdf-optimizer \
-  --build-arg "APT_PACKAGES=tesseract-ocr tesseract-ocr-eng tesseract-ocr-ukr ghostscript" \
-  -t vumlo-plugin-pdf-optimizer .
-```
+The container listens on port 8000 as a non-root user; `GET /manifest` returns the plugin manifest. Images carry no
+system packages by default; a plugin that needs some lists them in `<plugin>/apt-packages.txt`, passed as
+`--build-arg "APT_PACKAGES=..."`.
 
 ## Releases and `create-vumlo`
 
-A release of this repository is what `npx create-vumlo` offers as the trusted
-plugin list: every top-level directory containing an `app.py` is one plugin.
-The installer copies the chosen plugin directories plus `vumlo_plugins/`,
-`pyproject.toml`, `uv.lock`, `Dockerfile` and `LICENSE` and builds one image
-per plugin with the `PLUGIN` build arg.
+A release of this repository is what `npx create-vumlo` offers as the trusted plugin list: every top-level directory
+containing an `app.py` is one plugin. The installer copies the chosen plugin directories plus `vumlo_plugins/`,
+`pyproject.toml`, `uv.lock`, `Dockerfile` and `LICENSE` and builds one image per plugin with the `PLUGIN` build arg.
